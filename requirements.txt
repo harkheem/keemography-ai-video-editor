@@ -1,14 +1,11 @@
-# Core
 streamlit==1.45.1
 python-dotenv==1.0.1
 Pillow==10.3.0
 numpy==1.26.4
 tqdm==4.66.4
 
-# OpenAI SDK (Whisper API + Embeddings)
 openai>=1.43.0
 
-# Video pipeline
 moviepy==1.0.3
 imageio==2.34.0
 imageio-ffmpeg==0.5.1

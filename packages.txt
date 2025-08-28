@@ -1,5 +1,5 @@
 ffmpeg
 imagemagick
-fonts-dejavu-core
 libgl1
 libglib2.0-0
+fonts-dejavu-core
