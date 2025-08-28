@@ -2,14 +2,14 @@ streamlit==1.45.1
 python-dotenv==1.0.1
 openai==1.51.0
 
-# Video stack (stable wheels)
+# Video stack
 moviepy==1.0.3
 imageio==2.34.0
 imageio-ffmpeg==0.5.1
-Pillow==10.3.0
+Pillow==9.5.0
 numpy==1.26.4
 tqdm==4.66.4
 
-# Make builds predictable on Cloud
-setuptools==68.2.2
-wheel==0.41.2
+# moviepy deps pinned to safe versions
+proglog==0.1.10
+decorator==4.4.2
