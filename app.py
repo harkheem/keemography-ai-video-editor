@@ -9,9 +9,9 @@ from editor import generate_video, transcribe_videos
 from scoring import score_clips_with_story
 from utils import create_temp_file  # optional helper
 
-# ---------- ENV ----------
+# ---------- ENV/ secrets----------
 load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or st.secrets.get("API_KEY")
 
 # ---------- STREAMLIT PAGE CONFIG ----------
 st.set_page_config(
