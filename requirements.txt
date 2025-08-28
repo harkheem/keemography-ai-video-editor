@@ -1,0 +1,10 @@
+streamlit
+python-dotenv
+moviepy
+openai-whisper
+sentence-transformers
+torch --extra-index-url https://download.pytorch.org/whl/cpu
+numpy<2.0
+opencv-python-headless
+scenedetect
+Pillow
