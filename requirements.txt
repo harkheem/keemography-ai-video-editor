@@ -1,10 +1,21 @@
 streamlit
 python-dotenv
-moviepy
-openai-whisper
-sentence-transformers
-torch --extra-index-url https://download.pytorch.org/whl/cpu
-numpy<2.0
-opencv-python-headless
-scenedetect
+
+# --- Video stack (pin to stable, includes transitive deps explicitly) ---
+moviepy==1.0.3
+imageio==2.31.1
+imageio-ffmpeg==0.4.9
+proglog==0.1.10
+decorator==5.1.1
 Pillow
+numpy<2.0
+
+# --- CV / scene detection (headless build) ---
+opencv-python-headless==4.8.1.78
+scenedetect==0.6.7
+
+# --- NLP / models ---
+sentence-transformers
+# CPU wheel index for Torch (Whisper needs torch); if build is slow, we can revisit
+torch --extra-index-url https://download.pytorch.org/whl/cpu
+openai-whisper
