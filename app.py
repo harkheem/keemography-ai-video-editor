@@ -17,24 +17,15 @@ ensure("numpy>=2.0.2", "numpy")
 # ----------------------------------------------------------
 
 # now your normal imports:
-
-
-
-
-
-
-
-
-
-
-
-
 import os
 import tempfile
 from datetime import datetime
 
 import streamlit as st
 from dotenv import load_dotenv
+
+# NEW: for server-side fetch
+import requests, re
 
 from editor import generate_video, transcribe_videos
 from scoring import score_clips_with_story
@@ -94,7 +85,6 @@ with st.sidebar:
         index=0,
     )
     # These toggles are cosmetic for now (editor.py doesn’t use them).
-    # You can wire them up later if you extend generate_video().
     mix_original_audio = st.toggle("Mix original audio with music (ducking)", value=False)
     show_opening_card = st.toggle("Show opening title card", value=True)
 
@@ -111,6 +101,76 @@ uploaded_files = st.file_uploader(
     type=["mp4", "mpeg4"],
     accept_multiple_files=True,
 )
+
+# ========== SERVER-SIDE FETCH (2GB+) ==========
+if "fetched_paths" not in st.session_state:
+    st.session_state.fetched_paths = []
+
+def _normalize_drive_dropbox(url: str) -> str:
+    """Convert common share links to direct-download links when possible."""
+    u = url.strip()
+    # Google Drive: https://drive.google.com/file/d/<ID>/view -> https://drive.google.com/uc?export=download&id=<ID>
+    m = re.search(r"https?://drive\.google\.com/file/d/([a-zA-Z0-9_-]+)", u)
+    if m:
+        return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+    # Dropbox share -> direct dl
+    if "dropbox.com" in u:
+        if "?dl=0" in u:
+            return u.replace("?dl=0", "?dl=1")
+        if "?dl=1" not in u:
+            return u + "?dl=1"
+    return u
+
+st.markdown("**Or paste direct MP4 URLs for large files (2GB+):**")
+urls = st.text_area(
+    "One or more URLs (comma or newline separated)",
+    placeholder="https://example.com/video1.mp4\nhttps://example.com/video2.mp4",
+)
+
+cols_fetch = st.columns([1,1,2])
+with cols_fetch[0]:
+    fetch_clicked = st.button("⬇️ Fetch from URLs")
+with cols_fetch[1]:
+    clear_fetched = st.button("🧹 Clear fetched")
+
+if clear_fetched:
+    st.session_state.fetched_paths = []
+    st.info("Cleared fetched files list.")
+
+if fetch_clicked and urls.strip():
+    st.session_state.fetched_paths = []  # reset on every fetch
+    url_list = [u.strip() for u in re.split(r"[,\n]+", urls) if u.strip()]
+    for u in url_list:
+        direct = _normalize_drive_dropbox(u)
+        try:
+            st.write(f"⬇️ Fetching {direct} ...")
+            with requests.get(direct, stream=True, timeout=1200) as r:
+                r.raise_for_status()
+                total = int(r.headers.get("content-length", 0))
+                size_mb = total / (1024 * 1024) if total else None
+                if size_mb:
+                    st.info(f"Downloading ~{size_mb:.1f} MB")
+                prog = st.progress(0.0)
+                downloaded = 0
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024 * 50):  # 50MB
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if total:
+                                prog.progress(min(1.0, downloaded / total))
+                    saved = f.name
+            st.session_state.fetched_paths.append(saved)
+            st.success(f"✅ Saved to {saved}")
+        except Exception as e:
+            st.error(f"Download failed for {u}: {e}")
+
+if st.session_state.fetched_paths:
+    st.caption("Fetched files ready:")
+    for p in st.session_state.fetched_paths:
+        st.code(p)
+
+# ==============================================
 
 storyline = st.text_area(
     "What story do you want the final video to tell?",
@@ -144,8 +204,11 @@ run = st.button("✨ Generate Video", type="primary")
 
 if run:
     # Basic validation
-    if not uploaded_files:
-        st.error("Please upload at least one video.")
+    has_uploads = bool(uploaded_files) and any(not _too_big(f, size_limit_mb) for f in uploaded_files)
+    has_fetched = bool(st.session_state.fetched_paths)
+
+    if not (has_uploads or has_fetched):
+        st.error("Please upload at least one video or fetch from URLs above.")
         st.stop()
     if not storyline.strip():
         st.error("Please describe the story you want the final video to tell.")
@@ -164,18 +227,22 @@ if run:
     try:
         with st.spinner("Transcribing and editing your video..."):
             # Save uploads to tmp files (skip oversized)
-            kept_files = [f for f in uploaded_files if not _too_big(f, size_limit_mb)]
-            if not kept_files:
-                st.error("All files were above the size limit. Increase the limit or upload smaller files.")
-                st.stop()
-
+            kept_files = [f for f in (uploaded_files or []) if not _too_big(f, size_limit_mb)]
             for i, uf in enumerate(kept_files):
                 progress_text.write(f"📥 Saving clip {i + 1} of {len(kept_files)}...")
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
                     tmp.write(uf.read())
                     temp_video_paths.append(tmp.name)
                 # Up to 25% during save
-                progress_bar.progress(min(25, int((i + 1) / max(1, len(kept_files)) * 25)))
+                if kept_files:
+                    progress_bar.progress(min(25, int((i + 1) / max(1, len(kept_files)) * 25)))
+
+            # Add any server-fetched big files
+            temp_video_paths.extend(st.session_state.fetched_paths)
+
+            if not temp_video_paths:
+                st.error("No usable video clips found. Please upload or fetch at least one clip.")
+                st.stop()
 
             # Transcribe via OpenAI Whisper API (inside editor.transcribe_videos)
             progress_text.write("📝 Transcribing clips...")
