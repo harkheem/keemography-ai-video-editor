@@ -1,9 +1,21 @@
 # editor.py
-import os
-import tempfile
-import random
-from typing import List, Dict, Optional
 
+# ---- bootstrap critical deps (needed on Streamlit Cloud before import) ----
+import sys, subprocess, importlib.util
+
+def ensure(spec: str, import_name: str | None = None):
+    name = import_name or spec.split("==")[0].split(">=")[0].split("[")[0]
+    if importlib.util.find_spec(name) is None:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", spec])
+
+ensure("moviepy==2.1.1", "moviepy")
+ensure("imageio-ffmpeg>=0.5.1", "imageio_ffmpeg")
+ensure("imageio>=2.34.0", "imageio")
+ensure("Pillow>=10.4.0", "PIL")
+ensure("numpy>=2.0.2", "numpy")
+# ---------------------------------------------------------------------------
+
+# Now safe to import MoviePy & friends exactly once
 from moviepy.editor import (
     VideoFileClip,
     concatenate_videoclips,
@@ -12,6 +24,12 @@ from moviepy.editor import (
     TextClip,
     AudioFileClip,
 )
+
+import os
+import tempfile
+import random
+from typing import List, Dict, Optional
+
 from transition import apply_transition, list_available_transitions
 
 
@@ -71,16 +89,6 @@ def generate_video(
     """
     Builds a final video by stitching clips with random transitions,
     optional title card, and background music.
-    Args:
-        clip_paths: ordered list of clip file paths to use.
-        storyline: (unused here, but left for future titling/captions).
-        transition_duration: seconds for transitions/fades.
-        tone: selects background music and (optionally) title style.
-        mix_original_audio: if True, mix original clip audio under music
-                            (simple ducking via lower music volume).
-        show_opening_card: if True, add a 3s title card overlay at start.
-    Returns:
-        Path to a temporary .mp4 file.
     """
     clips: List[VideoFileClip] = []
 
@@ -168,14 +176,12 @@ def generate_video(
     try:
         if bg_music_clip and final.audio is not None:
             if mix_original_audio:
-                # Keep original audio AND music under it (simple ducking by lowering music)
                 mixed = CompositeAudioClip([
                     final.audio.volumex(1.0),
-                    bg_music_clip.volumex(0.15),  # lower music to sit under voices
+                    bg_music_clip.volumex(0.15),  # duck music under voices
                 ])
                 final = final.set_audio(mixed)
             else:
-                # Replace with background music only
                 final = final.set_audio(bg_music_clip)
         elif bg_music_clip and final.audio is None:
             final = final.set_audio(bg_music_clip)
@@ -198,7 +204,6 @@ def generate_video(
         print(f"❌ Failed to write video file: {e}")
         raise
     finally:
-        # Clean up MoviePy readers
         try:
             final.close()
         except Exception:
