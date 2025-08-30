@@ -1,15 +1,14 @@
 streamlit==1.45.1
 python-dotenv==1.0.1
 openai==1.51.0
-
-# Video stack (py3.12-safe)
 moviepy==2.1.1
 imageio>=2.34.0
 imageio-ffmpeg>=0.5.1
 Pillow>=10.4.0
 numpy>=2.0.2
 tqdm>=4.66.4
-
-# Modern build tools (do NOT pin to old ones)
+proglog>=0.1.10
+decorator>=5.1.1
+requests>=2.32.3
 setuptools>=75.0.0
 wheel>=0.44.0
