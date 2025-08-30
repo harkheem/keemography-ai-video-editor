@@ -1,4 +1,34 @@
 # app.py
+
+# ---- bootstrap critical deps if the build missed them ----
+import sys, subprocess, importlib.util
+
+def ensure(spec: str, import_name: str | None = None):
+    name = import_name or spec.split("==")[0].split(">=")[0].split("[")[0]
+    if importlib.util.find_spec(name) is None:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", spec])
+
+# minimal set for your editor imports
+ensure("moviepy==2.1.1", "moviepy")
+ensure("imageio-ffmpeg>=0.5.1", "imageio_ffmpeg")
+ensure("imageio>=2.34.0", "imageio")
+ensure("Pillow>=10.4.0", "PIL")
+ensure("numpy>=2.0.2", "numpy")
+# ----------------------------------------------------------
+
+# now your normal imports:
+
+
+
+
+
+
+
+
+
+
+
+
 import os
 import tempfile
 from datetime import datetime
