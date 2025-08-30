@@ -88,7 +88,7 @@ h1,h2,h3,h4 { color: var(--text); }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("AI VIDEO EDITOR")
+st.title("AI VIDEO EDITOR BY KEEMOGRAPHY")
 
 
 # ---------------- SIDEBAR ----------------
@@ -123,7 +123,7 @@ left, right = st.columns([0.36, 0.64], gap="large")
 
 # -------- LEFT: Text panel + inputs --------
 with left:
-    st.markdown("### TEXT TO VIDEO")
+    st.markdown("### TELL YOUR STORY")
     storyline = st.text_area(
         " ",
         height=180,
@@ -159,7 +159,7 @@ with left:
 
     urls = st.text_area(
         "One or more URLs (comma or newline separated)",
-        placeholder="https://example.com/video1.mp4\nhttps://example.com/video2.mp4",
+        placeholder="https://dropbox.com/video1.mp4\nhttps://googledrive.com/video2.mp4",
     )
     colA, colB = st.columns([1,1])
     with colA:
