@@ -1,6 +1,6 @@
 # editor.py
 
-# ---- bootstrap critical deps (needed on Streamlit Cloud before import) ----
+# ---- bootstrap critical deps (handy on Streamlit Cloud before import) ----
 import sys, subprocess, importlib.util
 
 def ensure(spec: str, import_name: str | None = None):
@@ -13,17 +13,7 @@ ensure("imageio-ffmpeg>=0.5.1", "imageio_ffmpeg")
 ensure("imageio>=2.34.0", "imageio")
 ensure("Pillow>=10.4.0", "PIL")
 ensure("numpy>=2.0.2", "numpy")
-# ---------------------------------------------------------------------------
-
-# Now safe to import MoviePy & friends exactly once
-from moviepy.editor import (
-    VideoFileClip,
-    concatenate_videoclips,
-    CompositeVideoClip,
-    CompositeAudioClip,
-    TextClip,
-    AudioFileClip,
-)
+# -------------------------------------------------------------------------
 
 import os
 import tempfile
@@ -90,7 +80,19 @@ def generate_video(
     Builds a final video by stitching clips with random transitions,
     optional title card, and background music.
     """
-    clips: List[VideoFileClip] = []
+
+    # Lazy-import MoviePy so this module can be imported even if deps
+    # weren’t present at process start (bootstrap above will install them).
+    from moviepy.editor import (
+        VideoFileClip,
+        concatenate_videoclips,
+        CompositeVideoClip,
+        CompositeAudioClip,
+        TextClip,
+        AudioFileClip,
+    )
+
+    clips: List["VideoFileClip"] = []
 
     # Load usable clips with safety trim for transitions
     for path in clip_paths:
@@ -117,7 +119,7 @@ def generate_video(
     available_transitions = list_available_transitions()
 
     # Add fade-in to first clip
-    final_clips: List[VideoFileClip] = [clips[0].fadein(transition_duration)]
+    final_clips: List["VideoFileClip"] = [clips[0].fadein(transition_duration)]
 
     # Apply a transition between each pair
     for i in range(1, len(clips)):
@@ -176,12 +178,14 @@ def generate_video(
     try:
         if bg_music_clip and final.audio is not None:
             if mix_original_audio:
+                # Keep original audio AND music under it (simple ducking by lowering music)
                 mixed = CompositeAudioClip([
                     final.audio.volumex(1.0),
                     bg_music_clip.volumex(0.15),  # duck music under voices
                 ])
                 final = final.set_audio(mixed)
             else:
+                # Replace with background music only
                 final = final.set_audio(bg_music_clip)
         elif bg_music_clip and final.audio is None:
             final = final.set_audio(bg_music_clip)
@@ -204,6 +208,7 @@ def generate_video(
         print(f"❌ Failed to write video file: {e}")
         raise
     finally:
+        # Clean up MoviePy readers
         try:
             final.close()
         except Exception:
