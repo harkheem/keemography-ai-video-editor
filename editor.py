@@ -1,4 +1,6 @@
-# editor.py
+# =============================
+# editor.py (FULL, CORRECTED)
+# =============================
 
 # ---- bootstrap critical deps (handy on Streamlit Cloud before import) ----
 import sys, subprocess, importlib.util
@@ -18,19 +20,22 @@ ensure("numpy>=2.0.2", "numpy")
 import os
 import tempfile
 import random
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Union
+import requests
+from urllib.parse import urljoin
+from bs4 import BeautifulSoup
+from googleapiclient.discovery import build
+import re
 
 from transition import apply_transition, list_available_transitions
 
 
-# --- OpenAI API key helper (works with .env or Streamlit Secrets) ---
 def _get_api_key(explicit_key: Optional[str] = None) -> Optional[str]:
     if explicit_key:
         return explicit_key
     return os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY")
 
 
-# --- Transcription via OpenAI Whisper API (no local torch/whisper needed) ---
 def transcribe_videos(
     video_paths: List[str],
     openai_api_key: Optional[str] = None,
@@ -39,13 +44,11 @@ def transcribe_videos(
     Transcribe each video using OpenAI Whisper API (model='whisper-1').
     Returns: list of dicts like {"path": <path>, "text": <transcript>}
     """
-    from openai import OpenAI  # lightweight import
+    from openai import OpenAI
 
     api_key = _get_api_key(openai_api_key)
     if not api_key:
-        raise RuntimeError(
-            "Missing OpenAI API key. Set API_KEY or OPENAI_API_KEY in env/secrets."
-        )
+        raise RuntimeError("Missing OpenAI API key. Set API_KEY or OPENAI_API_KEY.")
 
     client = OpenAI(api_key=api_key)
     results: List[Dict[str, str]] = []
@@ -59,30 +62,102 @@ def transcribe_videos(
                 )
             text = getattr(tx, "text", "") or ""
         except Exception as e:
-            # Don't crash entire job; record empty text and continue.
-            print(f"⚠️ Transcription failed for {path}: {e}")
+            print(f"⚠️ Transcription failed for {path}: {repr(e)}")
             text = ""
         results.append({"path": path, "text": text})
 
     return results
 
 
-# --- Video generation ---
+VIDEO_EXTENSIONS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
+
+def extract_video_links_from_page(url: str) -> list[str]:
+    """
+    Given a URL to a web page, extract all video file links (.mp4, .mov, etc.).
+    Returns a list of absolute URLs.
+    """
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        links = set()
+        # Find <a href=...> and <video src=...> and <source src=...>
+        for tag in soup.find_all(["a", "video", "source"]):
+            src = tag.get("href") or tag.get("src")
+            if src and any(src.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
+                abs_url = urljoin(url, src)
+                links.add(abs_url)
+        return list(links)
+    except Exception as e:
+        print(f"⚠️ Failed to extract video links from {url}: {repr(e)}")
+        return []
+
+def extract_gdrive_folder_videos(folder_url: str) -> list[str]:
+    """
+    Given a Google Drive folder URL, return a list of direct download links for video files in the folder.
+    Only works for public folders/files.
+    """
+    # Extract folder ID from URL
+    m = re.search(r"/folders/([a-zA-Z0-9_-]+)", folder_url)
+    if not m:
+        print(f"⚠️ Could not extract folder ID from {folder_url}")
+        return []
+    folder_id = m.group(1)
+    try:
+        service = build("drive", "v3", developerKey=os.getenv("GOOGLE_API_KEY"))
+        # Query for video files in the folder
+        query = f"'{folder_id}' in parents and mimeType contains 'video/' and trashed = false"
+        results = service.files().list(q=query, fields="files(id, name, mimeType)", pageSize=1000).execute()
+        files = results.get("files", [])
+        links = []
+        for f in files:
+            # Only allow known video extensions
+            if any(f["name"].lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
+                # Public direct download link format
+                links.append(f"https://drive.google.com/uc?id={f['id']}&export=download")
+        return links
+    except Exception as e:
+        print(f"⚠️ Failed to extract videos from Google Drive folder: {repr(e)}")
+        return []
+
+def normalize_clip_paths(clip_paths: list[Union[str, None]]) -> list[str]:
+    """
+    Given a list of paths/URLs, expand any page URLs into their video links.
+    Returns a flat list of video file paths/URLs.
+    """
+    out = []
+    for p in clip_paths:
+        if not isinstance(p, str):
+            continue
+        # Google Drive folder support
+        if re.match(r"https?://drive\.google\.com/.*/folders/", p):
+            found = extract_gdrive_folder_videos(p)
+            out.extend(found)
+        elif p.startswith(("http://", "https://")) and not p.lower().endswith(VIDEO_EXTENSIONS):
+            # Treat as a page, try to extract video links
+            found = extract_video_links_from_page(p)
+            out.extend(found)
+        else:
+            out.append(p)
+    return out
+
+
 def generate_video(
     clip_paths: List[str],
     storyline: str,
-    transition_duration: float = 1.0,
+    transition_duration: float = 0.3,   # ✅ safer default
     tone: str = "Cinematic",
     mix_original_audio: bool = False,
     show_opening_card: bool = True,
 ) -> str:
     """
-    Builds a final video by stitching clips with random transitions,
+    Builds a final video by stitching clips with adaptive transitions,
     optional title card, and background music.
+
+    This version NEVER over-trims short clips and provides better
+    error details if no clips can be opened.
     """
 
-    # Lazy-import MoviePy so this module can be imported even if deps
-    # weren’t present at process start (bootstrap above will install them).
     from moviepy.editor import (
         VideoFileClip,
         concatenate_videoclips,
@@ -92,55 +167,132 @@ def generate_video(
         AudioFileClip,
     )
 
-    clips: List["VideoFileClip"] = []
+    # --- Tunables ---
+    MIN_KEEP_SEC = 0.40
+    IDEAL_TRANSITION = max(0.15, float(transition_duration))
 
-    # Load usable clips with safety trim for transitions
-    for path in clip_paths:
+    clips: List["VideoFileClip"] = []
+    load_failures: List[str] = []
+    temp_files: List[str] = []  # Track temp files for cleanup
+
+    def is_url(path: str) -> bool:
+        return isinstance(path, str) and path.startswith(("http://", "https://"))
+
+    def download_to_temp(url: str) -> Optional[str]:
         try:
+            resp = requests.get(url, stream=True, timeout=30)
+            resp.raise_for_status()
+            content_type = resp.headers.get('Content-Type', '')
+            if not content_type.startswith('video/'):
+                print(f"⚠️ Skipping download: {url} (Content-Type: {content_type})")
+                return None
+            suffix = os.path.splitext(url)[-1] if "." in url else ".mp4"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    tmp.write(chunk)
+                return tmp.name
+        except Exception as e:
+            print(f"⚠️ Failed to download {url}: {repr(e)}")
+            return None
+
+    # Normalize clip paths
+    clip_paths = normalize_clip_paths(clip_paths)
+
+    # Load clips robustly
+    for path in clip_paths:
+        orig_path = path
+        try:
+            if not isinstance(path, str):
+                load_failures.append(f"{path} | not-a-string")
+                continue
+            if is_url(path):
+                path = download_to_temp(path)
+                if not path:
+                    load_failures.append(f"{orig_path} | download-failed")
+                    continue
+                temp_files.append(path)
+            if not os.path.exists(path):
+                load_failures.append(f"{orig_path} | missing")
+                continue
+            if os.path.getsize(path) < 1024:
+                load_failures.append(f"{orig_path} | tiny-file")
+                continue
+
             clip = VideoFileClip(path)
 
-            # Prevent overflow at clip end during transitions
-            trim_buffer = max(transition_duration, 0.5)
-            safe_duration = max(clip.duration - trim_buffer, 0.5)
-            clip = clip.subclip(0, safe_duration)
-
-            if clip.duration < 1.0:
-                print(f"⚠️ Skipping clip {path} (too short: {clip.duration:.2f}s)")
+            if not clip.duration or clip.duration < MIN_KEEP_SEC:
+                load_failures.append(f"{orig_path} | too-short:{clip.duration}")
+                try:
+                    clip.close()
+                except Exception:
+                    pass
                 continue
 
             clips.append(clip)
 
         except Exception as e:
-            print(f"❌ Skipping corrupted/unreadable clip: {path} | Error: {e}")
+            load_failures.append(f"{orig_path} | open-failed:{repr(e)}")
 
     if not clips:
-        raise ValueError("No usable clips provided to generate_video().")
+        # Give you useful info instead of the generic ValueError
+        preview = "\n".join(load_failures[:12]) if load_failures else "(no failure details)"
+        # Clean up any temp files before raising
+        for f in temp_files:
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+        raise ValueError(
+            "No usable clips provided to generate_video().\n"
+            "Top load failures:\n" + preview
+        )
 
     available_transitions = list_available_transitions()
 
-    # Add fade-in to first clip
-    final_clips: List["VideoFileClip"] = [clips[0].fadein(transition_duration)]
+    def transition_for_pair(a, b) -> float:
+        # At most 20% of the shorter clip
+        max_allowed = 0.20 * min(a.duration, b.duration)
+        safe = min(IDEAL_TRANSITION, max_allowed)
+        return safe if safe >= 0.12 else 0.0
 
-    # Apply a transition between each pair
+    # First clip fade
+    first_fade = min(IDEAL_TRANSITION, 0.25 * clips[0].duration)
+    first_fade = first_fade if first_fade >= 0.12 else 0.0
+    final_clips: List["VideoFileClip"] = [clips[0].fadein(first_fade) if first_fade else clips[0]]
+
+    # Per-cut paddings
+    paddings: List[float] = []
+
     for i in range(1, len(clips)):
-        transition = random.choice(available_transitions)
-        try:
-            transitioned = apply_transition(
-                final_clips[-1], clips[i], transition, transition_duration
-            )
-            final_clips[-1] = transitioned.set_end(transitioned.duration)
-            final_clips.append(clips[i].fadein(transition_duration))
-        except Exception as e:
-            print(f"⚠️ Failed transition for clip {i} ({transition}): {e}")
-            final_clips.append(clips[i].fadein(transition_duration))
+        prev = final_clips[-1]
+        nxt = clips[i]
+        tdur = transition_for_pair(prev, nxt)
 
-    # Compose the full video (negative padding to blend crossfades)
-    final = concatenate_videoclips(
-        final_clips, method="compose", padding=-transition_duration
-    )
+        if tdur > 0 and available_transitions:
+            transition = random.choice(available_transitions)
+            try:
+                transitioned = apply_transition(prev, nxt, transition, tdur)
+                final_clips[-1] = transitioned.set_end(transitioned.duration)
 
-    # Optional intro overlay
-    if show_opening_card and tone.lower() == "cinematic":
+                fade_next = min(tdur, 0.25 * nxt.duration)
+                fade_next = fade_next if fade_next >= 0.12 else 0.0
+                final_clips.append(nxt.fadein(fade_next) if fade_next else nxt)
+
+                paddings.append(-tdur)
+                continue
+            except Exception as e:
+                print(f"⚠️ Transition failed ({transition}) at clip {i}: {repr(e)}")
+
+        # fallback: no transition (or tiny fade)
+        fade_next = min(0.12, 0.15 * nxt.duration)
+        fade_next = fade_next if fade_next >= 0.08 else 0.0
+        final_clips.append(nxt.fadein(fade_next) if fade_next else nxt)
+        paddings.append(0.0)
+
+    final = concatenate_videoclips(final_clips, method="compose", padding=paddings)
+
+    # Optional opening card
+    if show_opening_card and (tone or "").lower() == "cinematic":
         overlays = []
         try:
             overlays.append(
@@ -156,14 +308,13 @@ def generate_video(
                 .fadeout(0.5)
             )
         except Exception as e:
-            # TextClip requires ImageMagick; if unavailable, just skip.
-            print(f"ℹ️ Skipping TextClip overlay (likely no ImageMagick): {e}")
+            print(f"ℹ️ Skipping TextClip overlay (likely missing ImageMagick): {repr(e)}")
             overlays = []
 
         if overlays:
             final = CompositeVideoClip([final] + overlays)
 
-    # Background music based on tone (if assets exist)
+    # Background music
     music_path = _get_music_for_tone(tone)
     bg_music_clip = None
     if music_path and os.path.exists(music_path):
@@ -171,29 +322,26 @@ def generate_video(
             bg_music_clip = AudioFileClip(music_path).volumex(0.2)
             bg_music_clip = bg_music_clip.subclip(0, min(bg_music_clip.duration, final.duration))
         except Exception as e:
-            print(f"⚠️ Could not load background music: {e}")
+            print(f"⚠️ Could not load background music: {repr(e)}")
             bg_music_clip = None
 
-    # Audio mixing logic
+    # Audio mixing
     try:
         if bg_music_clip and final.audio is not None:
             if mix_original_audio:
-                # Keep original audio AND music under it (simple ducking by lowering music)
                 mixed = CompositeAudioClip([
                     final.audio.volumex(1.0),
-                    bg_music_clip.volumex(0.15),  # duck music under voices
+                    bg_music_clip.volumex(0.15),
                 ])
                 final = final.set_audio(mixed)
             else:
-                # Replace with background music only
                 final = final.set_audio(bg_music_clip)
         elif bg_music_clip and final.audio is None:
             final = final.set_audio(bg_music_clip)
-        # else: keep whatever audio is there
     except Exception as e:
-        print(f"⚠️ Audio mix failed, keeping existing audio: {e}")
+        print(f"⚠️ Audio mix failed, keeping existing audio: {repr(e)}")
 
-    # Write to a temp mp4
+    # Write output
     temp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     try:
         final.write_videofile(
@@ -205,10 +353,9 @@ def generate_video(
             preset="medium",
         )
     except Exception as e:
-        print(f"❌ Failed to write video file: {e}")
+        print(f"❌ Failed to write video file: {repr(e)}")
         raise
     finally:
-        # Clean up MoviePy readers
         try:
             final.close()
         except Exception:
@@ -221,6 +368,12 @@ def generate_video(
         if bg_music_clip:
             try:
                 bg_music_clip.close()
+            except Exception:
+                pass
+        # Clean up any temp files created for URLs
+        for f in temp_files:
+            try:
+                os.remove(f)
             except Exception:
                 pass
 
