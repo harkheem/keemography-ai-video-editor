@@ -26,6 +26,7 @@ import time
 import streamlit as st
 from dotenv import load_dotenv
 import requests, re
+import psutil
 
 # IMPORTANT: reload editor during dev so Streamlit doesn't keep an old version
 import importlib
@@ -156,8 +157,13 @@ with st.sidebar:
     transition_duration = st.slider("⏱️ Transition Duration (sec)", 0.15, 1.5, 0.3, 0.05)
     mix_original_audio = st.toggle("🎚️ Mix Original Audio", value=False)
     show_opening_card = st.toggle("🎬 Show Opening Card", value=True)
-    size_limit_mb = st.number_input("📦 Max File Size (MB)", 50, 2000, 500, 50)
+    size_limit_mb = st.number_input("📦 Max File Size (MB)", 50, 2000, 200, 50)
     st.caption("💡 Tip: Use short transitions for fast-paced edits.")
+    # Memory usage display
+    mem = psutil.virtual_memory()
+    st.write(f"🧠 Memory usage: {mem.percent}% ({mem.used // (1024**2)}MB / {mem.total // (1024**2)}MB)")
+    if mem.percent > 85:
+        st.warning("System memory is critically high! Try fewer/smaller clips or close other apps.")
 
 
 # ===================== EDITOR LAYOUT =====================
@@ -168,11 +174,34 @@ with left:
     st.subheader("📝 Tell Your Story")
     storyline = st.text_area("Describe your video story", height=140, placeholder="A cat is sitting on a window sill. The rain is falling outside.")
     st.subheader("📁 Add Clips")
-    uploaded_files = st.file_uploader("Upload MP4/MPEG4 files", type=["mp4", "mpeg4"], accept_multiple_files=True)
+    uploaded_files = st.file_uploader("Upload MP4/MPEG4 files (max 5, 200MB each)", type=["mp4", "mpeg4"], accept_multiple_files=True)
+    if uploaded_files and len(uploaded_files) > 5:
+        st.error("You can only upload up to 5 video files at once.")
+        uploaded_files = uploaded_files[:5]
+    for uf in uploaded_files or []:
+        if hasattr(uf, "size") and uf.size > 200 * 1024 * 1024:
+            st.warning(f"File {uf.name} is over 200MB and may cause memory issues.")
     st.caption("Or paste direct video URLs (comma/newline separated):")
     urls = st.text_area("Paste URLs", placeholder="https://.../video.mp4")
     fetch_clicked = st.button("⬇️ Fetch from URLs")
     clear_fetched = st.button("🧹 Clear fetched")
+
+    # --- New: User music upload ---
+    st.subheader("🎵 Add Your Own Music (optional)")
+    user_music_file = st.file_uploader("Upload MP3/WAV music", type=["mp3", "wav", "m4a", "aac", "ogg"], accept_multiple_files=False, key="music_upload")
+    user_music_path = None
+    if user_music_file:
+        if _too_big(user_music_file, 100):
+            st.warning("Music file is too large (max 100MB). Please upload a smaller file.")
+        else:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(user_music_file.name)[-1]) as tmp:
+                user_music_file.seek(0)
+                tmp.write(user_music_file.read())
+                user_music_path = tmp.name
+            st.success(f"Music uploaded: {user_music_file.name}")
+            st.caption("Your music will be used for beat-aligned editing. If the file is invalid or too short, default music will be used.")
+    else:
+        st.caption("If you don't upload music, a default soundtrack will be used based on your selected tone.")
 
     if clear_fetched:
         st.session_state.fetched_paths = []
@@ -388,6 +417,7 @@ if run:
                 tone=tone,
                 mix_original_audio=mix_original_audio,
                 show_opening_card=show_opening_card,
+                custom_music_path=user_music_path,  # <-- pass user music
             )
             progress_bar.progress(95)
             elapsed = time.time() - start_time
