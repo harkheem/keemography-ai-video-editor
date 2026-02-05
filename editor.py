@@ -15,6 +15,7 @@ ensure("imageio-ffmpeg>=0.5.1", "imageio_ffmpeg")
 ensure("imageio>=2.34.0", "imageio")
 ensure("Pillow>=10.4.0", "PIL")
 ensure("numpy>=2.0.2", "numpy")
+ensure("librosa>=0.9.2", "librosa")
 # -------------------------------------------------------------------------
 
 import os
@@ -26,6 +27,8 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from googleapiclient.discovery import build
 import re
+import concurrent.futures
+import librosa
 
 from transition import apply_transition, list_available_transitions
 
@@ -142,6 +145,20 @@ def normalize_clip_paths(clip_paths: list[Union[str, None]]) -> list[str]:
     return out
 
 
+def detect_beats(audio_path: str) -> list[float]:
+    """
+    Detect beat times (in seconds) in an audio file using librosa.
+    Returns a list of beat timestamps.
+    """
+    try:
+        y, sr = librosa.load(audio_path, sr=None, mono=True)
+        tempo, beats = librosa.beat.beat_track(y=y, sr=sr, units='time')
+        return beats.tolist()
+    except Exception as e:
+        print(f"⚠️ Beat detection failed: {repr(e)}")
+        return []
+
+
 def generate_video(
     clip_paths: List[str],
     storyline: str,
@@ -149,6 +166,7 @@ def generate_video(
     tone: str = "Cinematic",
     mix_original_audio: bool = False,
     show_opening_card: bool = True,
+    custom_music_path: Optional[str] = None,  # <-- new param
 ) -> str:
     """
     Builds a final video by stitching clips with adaptive transitions,
@@ -195,43 +213,35 @@ def generate_video(
             print(f"⚠️ Failed to download {url}: {repr(e)}")
             return None
 
-    # Normalize clip paths
-    clip_paths = normalize_clip_paths(clip_paths)
-
-    # Load clips robustly
-    for path in clip_paths:
+    # Parallelize downloads and loading
+    def load_clip(path: str) -> Optional["VideoFileClip"]:
         orig_path = path
         try:
             if not isinstance(path, str):
-                load_failures.append(f"{path} | not-a-string")
-                continue
+                return None
             if is_url(path):
                 path = download_to_temp(path)
                 if not path:
-                    load_failures.append(f"{orig_path} | download-failed")
-                    continue
+                    return None
                 temp_files.append(path)
-            if not os.path.exists(path):
-                load_failures.append(f"{orig_path} | missing")
-                continue
-            if os.path.getsize(path) < 1024:
-                load_failures.append(f"{orig_path} | tiny-file")
-                continue
-
+            if not os.path.exists(path) or os.path.getsize(path) < 1024:
+                return None
             clip = VideoFileClip(path)
-
             if not clip.duration or clip.duration < MIN_KEEP_SEC:
-                load_failures.append(f"{orig_path} | too-short:{clip.duration}")
-                try:
-                    clip.close()
-                except Exception:
-                    pass
-                continue
+                clip.close()
+                return None
+            return clip
+        except Exception:
+            return None
 
-            clips.append(clip)
+    # Normalize clip paths
+    clip_paths = normalize_clip_paths(clip_paths)
 
-        except Exception as e:
-            load_failures.append(f"{orig_path} | open-failed:{repr(e)}")
+    # Parallel load
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        loaded = list(executor.map(load_clip, clip_paths))
+    clips = [c for c in loaded if c is not None]
+    load_failures = [p for p, c in zip(clip_paths, loaded) if c is None]
 
     if not clips:
         # Give you useful info instead of the generic ValueError
@@ -247,6 +257,15 @@ def generate_video(
             "Top load failures:\n" + preview
         )
 
+    # --- Beat-aligned editing if user music provided ---
+    beat_times = []
+    if custom_music_path and os.path.exists(custom_music_path):
+        beat_times = detect_beats(custom_music_path)
+        # Only use beats within the total video duration
+        total_clip_duration = sum(c.duration for c in clips)
+        beat_times = [b for b in beat_times if b < total_clip_duration]
+
+    # --- Adaptive transitions, beat-aligned if possible ---
     available_transitions = list_available_transitions()
 
     def transition_for_pair(a, b) -> float:
@@ -254,6 +273,19 @@ def generate_video(
         max_allowed = 0.20 * min(a.duration, b.duration)
         safe = min(IDEAL_TRANSITION, max_allowed)
         return safe if safe >= 0.12 else 0.0
+
+    # If we have enough beats, align cuts to them
+    cut_points = []
+    if beat_times and len(beat_times) >= len(clips):
+        # Use beat times as cut points for each clip
+        cut_points = beat_times[:len(clips)]
+        # Optionally, trim/extend clips to match beat intervals
+        for i, c in enumerate(clips):
+            if i < len(cut_points)-1:
+                start = cut_points[i]
+                end = cut_points[i+1]
+                if end > start and c.duration > (end-start):
+                    clips[i] = c.subclip(0, end-start)
 
     # First clip fade
     first_fade = min(IDEAL_TRANSITION, 0.25 * clips[0].duration)
@@ -289,7 +321,21 @@ def generate_video(
         final_clips.append(nxt.fadein(fade_next) if fade_next else nxt)
         paddings.append(0.0)
 
-    final = concatenate_videoclips(final_clips, method="compose", padding=paddings)
+    # Use method='chain' if all clips have same size/fps
+    same_size = all((c.size == clips[0].size and c.fps == clips[0].fps) for c in clips)
+    concat_method = "chain" if same_size else "compose"
+    final = concatenate_videoclips(final_clips, method=concat_method, padding=paddings)
+
+    # --- Validate all clips before render ---
+    for idx, c in enumerate(clips):
+        if not hasattr(c, 'duration') or not hasattr(c, 'fps') or not hasattr(c, 'size'):
+            raise ValueError(f"Clip {idx} is missing required attributes (duration, fps, size).")
+        if c.duration is None or c.duration < 0.1:
+            raise ValueError(f"Clip {idx} has invalid duration: {c.duration}")
+        if c.fps is None or c.fps < 1:
+            raise ValueError(f"Clip {idx} has invalid fps: {c.fps}")
+        if not c.size or not isinstance(c.size, (tuple, list)) or len(c.size) != 2:
+            raise ValueError(f"Clip {idx} has invalid size: {c.size}")
 
     # Optional opening card
     if show_opening_card and (tone or "").lower() == "cinematic":
@@ -315,7 +361,11 @@ def generate_video(
             final = CompositeVideoClip([final] + overlays)
 
     # Background music
-    music_path = _get_music_for_tone(tone)
+    music_path = None
+    if custom_music_path and os.path.exists(custom_music_path):
+        music_path = custom_music_path
+    else:
+        music_path = _get_music_for_tone(tone)
     bg_music_clip = None
     if music_path and os.path.exists(music_path):
         try:
@@ -346,7 +396,7 @@ def generate_video(
     try:
         final.write_videofile(
             temp_out.name,
-            codec="libx264",
+            codec="h264_videotoolbox",  # Use hardware-accelerated encoding on macOS
             audio_codec="aac",
             fps=24,
             threads=2,
