@@ -190,43 +190,10 @@ def generate_video(
     IDEAL_TRANSITION = max(0.15, float(transition_duration))
 
     clips: List["VideoFileClip"] = []
-    load_failures: List[str] = []
-    temp_files: List[str] = []  # Track temp files for cleanup
 
-    def is_url(path: str) -> bool:
-        return isinstance(path, str) and path.startswith(("http://", "https://"))
-
-    def download_to_temp(url: str) -> Optional[str]:
+    # Load usable clips with safety trim for transitions
+    for path in clip_paths:
         try:
-            resp = requests.get(url, stream=True, timeout=30)
-            resp.raise_for_status()
-            content_type = resp.headers.get('Content-Type', '')
-            if not content_type.startswith('video/'):
-                print(f"⚠️ Skipping download: {url} (Content-Type: {content_type})")
-                return None
-            suffix = os.path.splitext(url)[-1] if "." in url else ".mp4"
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    tmp.write(chunk)
-                return tmp.name
-        except Exception as e:
-            print(f"⚠️ Failed to download {url}: {repr(e)}")
-            return None
-
-    # Parallelize downloads and loading
-    def load_clip(path: str) -> Optional["VideoFileClip"]:
-        orig_path = path
-        try:
-            if not isinstance(path, str):
-                return None
-            if is_url(path):
-                path = download_to_temp(path)
-                if not path:
-                    return None
-                temp_files.append(path)
-            # Upgrade file size limit to 1GB
-            if not os.path.exists(path) or os.path.getsize(path) < 1024 or os.path.getsize(path) > 1_000_000_000:
-                return None
             clip = VideoFileClip(path)
             if not clip.duration or clip.duration < MIN_KEEP_SEC:
                 clip.close()
