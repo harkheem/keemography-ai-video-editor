@@ -224,7 +224,8 @@ def generate_video(
                 if not path:
                     return None
                 temp_files.append(path)
-            if not os.path.exists(path) or os.path.getsize(path) < 1024:
+            # Upgrade file size limit to 1GB
+            if not os.path.exists(path) or os.path.getsize(path) < 1024 or os.path.getsize(path) > 1_000_000_000:
                 return None
             clip = VideoFileClip(path)
             if not clip.duration or clip.duration < MIN_KEEP_SEC:
