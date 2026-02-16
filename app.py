@@ -32,7 +32,75 @@ import psutil
 import importlib
 import editor as editor_mod
 importlib.reload(editor_mod)
-from editor import generate_video, transcribe_videos
+
+from editor import generate_video
+
+# --- Whisper API file size limit (MB) ---
+WHISPER_MAX_MB = 24  # OpenAI Whisper API limit (use 24MB for safety)
+
+def split_video_to_chunks(path, max_mb=WHISPER_MAX_MB):
+    """
+    Splits a video file into chunks under max_mb in size using moviepy.
+    Returns a list of temp file paths.
+    """
+    from moviepy import VideoFileClip
+    import math
+    import os
+    clip = VideoFileClip(path)
+    duration = clip.duration
+    filesize = os.path.getsize(path)
+    if filesize <= max_mb * 1024 * 1024:
+        clip.close()
+        return [path]
+    # Estimate chunk count
+    n_chunks = math.ceil(filesize / (max_mb * 1024 * 1024))
+    chunk_duration = duration / n_chunks
+    out_paths = []
+    for i in range(n_chunks):
+        start = i * chunk_duration
+        end = min((i + 1) * chunk_duration, duration)
+        subclip = clip.subclip(start, end)
+        temp_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+        subclip.write_videofile(temp_path, codec="libx264", audio_codec="aac", verbose=False, logger=None)
+        out_paths.append(temp_path)
+        subclip.close()
+    clip.close()
+    return out_paths
+
+def transcribe_videos_with_split(video_paths, openai_api_key=None):
+    """
+    Transcribe each video, splitting if needed. Returns list of dicts {path, text}.
+    """
+    results = []
+    for path in video_paths:
+        try:
+            chunks = split_video_to_chunks(path)
+            chunk_results = []
+            for chunk in chunks:
+                try:
+                    from openai import OpenAI
+                    client = OpenAI(api_key=openai_api_key)
+                    with open(chunk, "rb") as f:
+                        tx = client.audio.transcriptions.create(
+                            model="whisper-1",
+                            file=f,
+                        )
+                    text = getattr(tx, "text", "") or ""
+                    chunk_results.append(text)
+                except Exception as e:
+                    print(f"⚠️ Transcription failed for chunk {chunk}: {repr(e)}")
+                    chunk_results.append("")
+                finally:
+                    if chunk != path:
+                        try:
+                            os.remove(chunk)
+                        except Exception:
+                            pass
+            results.append({"path": path, "text": " ".join(chunk_results)})
+        except Exception as e:
+            print(f"⚠️ Transcription failed for {path}: {repr(e)}")
+            results.append({"path": path, "text": ""})
+    return results
 
 from scoring import score_clips_with_story
 
@@ -157,7 +225,6 @@ with st.sidebar:
     transition_duration = st.slider("⏱️ Transition Duration (sec)", 0.15, 1.5, 0.3, 0.05)
     mix_original_audio = st.toggle("🎚️ Mix Original Audio", value=False)
     show_opening_card = st.toggle("🎬 Show Opening Card", value=True)
-    size_limit_mb = st.number_input("📦 Max File Size (MB)", 50, 2000, 200, 50)
     st.caption("💡 Tip: Use short transitions for fast-paced edits.")
     # Memory usage display
     mem = psutil.virtual_memory()
@@ -174,13 +241,7 @@ with left:
     st.subheader("📝 Tell Your Story")
     storyline = st.text_area("Describe your video story", height=140, placeholder="A cat is sitting on a window sill. The rain is falling outside.")
     st.subheader("📁 Add Clips")
-    uploaded_files = st.file_uploader("Upload MP4/MPEG4 files (max 5, 200MB each)", type=["mp4", "mpeg4"], accept_multiple_files=True)
-    if uploaded_files and len(uploaded_files) > 5:
-        st.error("You can only upload up to 5 video files at once.")
-        uploaded_files = uploaded_files[:5]
-    for uf in uploaded_files or []:
-        if hasattr(uf, "size") and uf.size > 200 * 1024 * 1024:
-            st.warning(f"File {uf.name} is over 200MB and may cause memory issues.")
+    uploaded_files = st.file_uploader("Upload MP4/MPEG4 files (no file count limit, 2GB each)", type=["mp4", "mpeg4"], accept_multiple_files=True)
     st.caption("Or paste direct video URLs (comma/newline separated):")
     urls = st.text_area("Paste URLs", placeholder="https://.../video.mp4")
     fetch_clicked = st.button("⬇️ Fetch from URLs")
@@ -294,7 +355,8 @@ user_excluded_keywords = st.text_input(
 
 # ---------------- ACTION ----------------
 if run:
-    kept_files = [f for f in (uploaded_files or []) if not _too_big(f, size_limit_mb)]
+
+    kept_files = list(uploaded_files or [])
     has_uploads = bool(kept_files)
     has_fetched = bool(st.session_state.fetched_paths)
 
@@ -362,12 +424,12 @@ if run:
                 st.error("No usable video clips found after validation.")
                 st.stop()
 
-            # Transcribe
+            # Transcribe (with splitting)
             progress_text.write("📝 Transcribing clips...")
             elapsed = time.time() - start_time
             time_left = est_total_time - elapsed
             countdown_text.markdown(f"⏳ {format_time_left(time_left)}")
-            transcriptions = transcribe_videos(input_paths, openai_api_key=OPENAI_API_KEY)
+            transcriptions = transcribe_videos_with_split(input_paths, openai_api_key=OPENAI_API_KEY)
             progress_bar.progress(45)
 
             if not transcriptions:
