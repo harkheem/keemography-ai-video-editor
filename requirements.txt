@@ -32,7 +32,3 @@ lazy_loader>=0.1
 platformdirs>=2.5.0
 threadpoolctl>=3.1.0
 psutil>=5.9.0
-<<<<<<< HEAD
-=======
-
->>>>>>> a8e561f5ba8414e6932885ba8e742be15837aaf1

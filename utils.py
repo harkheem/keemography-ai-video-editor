@@ -1,6 +1,43 @@
 # utils.py
+# -------------------------------
+# Imports
+# -------------------------------
+import subprocess
+import os
 import tempfile
+import numpy as np
 from typing import List, Tuple, Optional
+
+
+# -------------------------------
+# Robust audio extraction using ffmpeg
+# -------------------------------
+def extract_audio_ffmpeg(input_video_path: str, output_audio_path: str, audio_format: str = "wav") -> str:
+    """
+    Example usage:
+        audio_path = extract_audio_ffmpeg("input.mp4", "output.wav")
+    Extracts audio from a video file using ffmpeg via subprocess.run().
+    Fails fast if ffmpeg is not found or extraction fails. Returns output audio path.
+    """
+    if not os.path.exists(input_video_path):
+        raise FileNotFoundError(f"Input video not found: {input_video_path}")
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-y",  # overwrite
+        "-i", input_video_path,
+        "-vn",  # no video
+        "-acodec", "pcm_s16le" if audio_format == "wav" else "aac",
+        output_audio_path
+    ]
+    try:
+        result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=True)
+    except FileNotFoundError:
+        raise RuntimeError("ffmpeg not detected. Please install ffmpeg and ensure it is in your PATH.")
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Audio extraction failed: {e.stderr}")
+    if not os.path.exists(output_audio_path):
+        raise RuntimeError("Audio extraction failed: output file not created.")
+    return output_audio_path
 
 
 # -------------------------------
@@ -40,7 +77,7 @@ def detect_scenes(video_path: str, threshold: float = 30.0) -> List[Tuple[float,
 # -------------------------------
 # Face crop (lazy import)
 # -------------------------------
-def crop_to_face(frame) -> "np.ndarray":
+def crop_to_face(frame) -> np.ndarray:
     """
     Crop around the largest detected face. If OpenCV isn't available or no faces are found,
     return the original frame. Expects an RGB frame (H x W x 3).
@@ -77,8 +114,10 @@ def add_text_overlay(clip, text: str, fontsize: int = 48, color: str = "white"):
     Draw a centered text overlay using PIL onto a transparent RGBA image,
     then composite it over the given MoviePy clip. No ImageMagick required.
     """
-    from moviepy.editor import ImageClip, CompositeVideoClip  # lightweight
-    import numpy as np
+    try:
+        from moviepy import ImageClip, CompositeVideoClip
+    except ImportError:
+        from moviepy.editor import ImageClip, CompositeVideoClip
     from PIL import Image, ImageDraw, ImageFont
 
     W, H = clip.size
@@ -113,7 +152,11 @@ def add_text_overlay(clip, text: str, fontsize: int = 48, color: str = "white"):
     draw.text((x + 2, y + 2), text, fill=shadow, font=font)
     draw.text((x, y), text, fill=color, font=font)
 
-    overlay = ImageClip(np.array(img)).set_duration(clip.duration).set_position(("center", "center"))
+    img_arr = np.array(img)
+    try:
+        overlay = ImageClip(img_arr).with_duration(clip.duration).with_position(("center", "center"))
+    except AttributeError:
+        overlay = ImageClip(img_arr).set_duration(clip.duration).set_position(("center", "center"))
     return CompositeVideoClip([clip, overlay])
 
 

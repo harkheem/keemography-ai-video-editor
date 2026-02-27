@@ -38,7 +38,7 @@ ai_video_editor_mvp/
 
 ## Requirements
 
-- Python 3.11+ (deployment target is `3.12` per `runtime.txt`)
+- Python 3.11+ (deployment target is `3.11` per `runtime.txt`)
 - FFmpeg installed and available in `PATH`
 - OpenAI API key
 

@@ -29,6 +29,7 @@ from googleapiclient.discovery import build
 import re
 import concurrent.futures
 import librosa
+import numpy as np
 
 from transition import apply_transition, list_available_transitions
 
@@ -162,11 +163,13 @@ def detect_beats(audio_path: str) -> list[float]:
 def generate_video(
     clip_paths: List[str],
     storyline: str,
-    transition_duration: float = 0.3,   # ✅ safer default
+    transition_duration: float = 0.3,
     tone: str = "Cinematic",
+    target_duration_sec: Optional[int] = None,
     mix_original_audio: bool = False,
     show_opening_card: bool = True,
-    custom_music_path: Optional[str] = None,  # <-- new param
+    custom_music_path: Optional[str] = None,
+    clip_metadata: Optional[Dict[str, Dict]] = None,  # keyed by path; from scoring
 ) -> str:
     """
     Builds a final video by stitching clips with adaptive transitions,
@@ -176,23 +179,368 @@ def generate_video(
     error details if no clips can be opened.
     """
 
-    from moviepy.editor import (
+    from moviepy import (
         VideoFileClip,
         concatenate_videoclips,
         CompositeVideoClip,
         CompositeAudioClip,
+        concatenate_audioclips,
         TextClip,
         AudioFileClip,
     )
 
-    # --- Tunables ---
+    temp_files = []
+
+    # ── Tone profile ─────────────────────────────────────────────────────────
+    # All per-tone knobs live here so the rest of the function just reads them.
+    _tone_key = (tone or "cinematic").strip().lower()
+    _TONE_PROFILES = {
+        #              fps  trim_mult  tdur_mult  motion_w  audio_w  music_vol
+        "energetic":  (30,   0.65,      0.45,      0.82,     0.12,    0.40),
+        "epic":       (30,   0.85,      0.70,      0.72,     0.18,    0.35),
+        "cinematic":  (24,   1.00,      1.00,      0.60,     0.30,    0.22),
+        "sentimental":(24,   1.20,      1.40,      0.35,     0.55,    0.18),
+        "calm":       (24,   1.35,      1.60,      0.30,     0.60,    0.15),
+    }
+    _fps, _trim_mult, _tdur_mult, _motion_w, _audio_w, _music_vol = \
+        _TONE_PROFILES.get(_tone_key, _TONE_PROFILES["cinematic"])
+    # transition type bias pools per tone
+    _TONE_TRANSITIONS = {
+        "energetic":   ["slide_left", "slide_right", "zoom_in", "slide_up"],
+        "epic":        ["zoom_in", "zoom_out", "slide_left", "slide_right"],
+        "cinematic":   ["crossfade", "fadein", "zoom_in"],
+        "sentimental": ["crossfade", "fadein", "fadeout"],
+        "calm":        ["crossfade", "fadein"],
+    }
+    _tone_transition_pool = _TONE_TRANSITIONS.get(_tone_key, list_available_transitions())
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── Storyline signal ─────────────────────────────────────────────────────
+    # Extract keywords from the user's stated storyline. These are used in two
+    # ways: (1) scaling the target duration of matching clips so they breathe
+    # more on screen; (2) biasing the content window search toward the
+    # GPT-4o-identified peak moment when the clip description overlaps the story.
+    def _extract_keywords(text: str) -> set:
+        stop = {
+            "the", "a", "an", "and", "or", "but", "to", "of", "in", "on",
+            "for", "with", "is", "are", "was", "were", "be", "been", "being",
+            "that", "this", "it", "as", "at", "by", "from", "i", "you",
+            "we", "they", "he", "she", "them", "our", "your", "its",
+        }
+        tokens = re.findall(r"[a-zA-Z0-9']+", (text or "").lower())
+        return {t for t in tokens if len(t) >= 4 and t not in stop}
+
+    _story_keywords = _extract_keywords(storyline or "")
+
+    def _story_weight(path: str) -> float:
+        """0.0-1.0: how much this clip's description overlaps with the storyline."""
+        if not _story_keywords:
+            return 0.0
+        meta = (_meta if isinstance(clip_metadata, dict) else {}).get(path, {})
+        description = str(meta.get("description", "") or "")
+        desc_tokens = _extract_keywords(description)
+        if not desc_tokens:
+            return 0.0
+        overlap = len(desc_tokens & _story_keywords)
+        return min(1.0, overlap / max(1, len(_story_keywords)))
+    # ─────────────────────────────────────────────────────────────────────────
+
     MIN_KEEP_SEC = 0.40
-    IDEAL_TRANSITION = max(0.15, float(transition_duration))
+    IDEAL_TRANSITION = max(0.15, float(transition_duration)) * _tdur_mult
 
-    clips: List["VideoFileClip"] = []
+    def apply_fadein(clip, duration: float):
+        if not duration or duration <= 0:
+            return clip
+        if hasattr(clip, "fadein"):
+            return clip.fadein(duration)
+        from moviepy import vfx
+        return clip.with_effects([vfx.FadeIn(duration)])
 
-    # Load usable clips with safety trim for transitions
-    for path in clip_paths:
+    def apply_fadeout(clip, duration: float):
+        if not duration or duration <= 0:
+            return clip
+        if hasattr(clip, "fadeout"):
+            return clip.fadeout(duration)
+        from moviepy import vfx
+        return clip.with_effects([vfx.FadeOut(duration)])
+
+    def apply_end(clip, end_time: float):
+        if end_time is None:
+            return clip
+        if hasattr(clip, "set_end"):
+            return clip.set_end(end_time)
+        if hasattr(clip, "with_end"):
+            return clip.with_end(end_time)
+        return clip
+
+    def apply_without_mask(clip):
+        if clip is None:
+            return clip
+        if hasattr(clip, "without_mask"):
+            return clip.without_mask()
+        if hasattr(clip, "set_mask"):
+            return clip.set_mask(None)
+        try:
+            clip.mask = None
+        except Exception:
+            pass
+        return clip
+
+    def apply_audio_volume(audio_clip, vol: float):
+        if audio_clip is None:
+            return None
+        if hasattr(audio_clip, "volumex"):
+            return audio_clip.volumex(vol)
+        if hasattr(audio_clip, "with_volume_scaled"):
+            return audio_clip.with_volume_scaled(vol)
+        return audio_clip
+
+    def apply_audio_subclip(audio_clip, start_t: float, end_t: float):
+        if audio_clip is None:
+            return None
+        if hasattr(audio_clip, "subclipped"):
+            return audio_clip.subclipped(start_t, end_t)
+        if hasattr(audio_clip, "subclip"):
+            return audio_clip.subclip(start_t, end_t)
+        return audio_clip
+
+    def apply_set_audio(video_clip, audio_clip):
+        if video_clip is None:
+            return None
+        if hasattr(video_clip, "set_audio"):
+            return video_clip.set_audio(audio_clip)
+        if hasattr(video_clip, "with_audio"):
+            return video_clip.with_audio(audio_clip)
+        return video_clip
+
+    def normalize_audio_for_mix(input_path: str) -> Optional[str]:
+        if not input_path or not os.path.exists(input_path):
+            return None
+        out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", input_path,
+            "-vn",
+            "-ac", "2",
+            "-ar", "44100",
+            "-c:a", "pcm_s16le",
+            out_path,
+        ]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            temp_files.append(out_path)
+            return out_path
+        except Exception as e:
+            print(f"⚠️ Audio normalization failed for {input_path}: {repr(e)}")
+            try:
+                os.remove(out_path)
+            except Exception:
+                pass
+            return None
+
+    def apply_subclip(clip, start_t: float, end_t: float):
+        start_t = max(0.0, float(start_t))
+        end_t = max(start_t + 0.05, float(end_t))
+        if hasattr(clip, "subclipped"):
+            return clip.subclipped(start_t, end_t)
+        if hasattr(clip, "subclip"):
+            return clip.subclip(start_t, end_t)
+        return clip
+
+    def enforce_target_duration(video_clip, requested_sec: Optional[int]):
+        if not requested_sec:
+            return video_clip
+
+        requested = float(max(1, int(requested_sec)))
+        current = float(getattr(video_clip, "duration", 0.0) or 0.0)
+        if current <= 0.05:
+            return video_clip
+
+        if current > requested + 0.02:
+            return apply_subclip(video_clip, 0.0, requested)
+
+        return video_clip
+
+    def apply_smart_trim(
+        clip,
+        idx: int,
+        total: int,
+        role: str = "development",
+        vision_trim_start: Optional[float] = None,
+        vision_trim_end: Optional[float] = None,
+        best_moment_sec: Optional[float] = None,
+        story_weight: float = 0.0,
+    ):
+        duration = float(getattr(clip, "duration", 0.0) or 0.0)
+        if duration <= 0.0:
+            return clip
+
+        desired_total = float(target_duration_sec) if target_duration_sec else 34.0
+        base_target = desired_total / max(1, total)
+
+        # Narrative-role multipliers: hooks are punchy, payoffs breathe
+        role_mult = {
+            "hook":        0.65,
+            "turn":        0.80,
+            "development": 1.00,
+            "broll":       0.75,
+            "payoff":      1.25,
+        }.get((role or "development").lower(), 1.0)
+        target = max(1.8, base_target * role_mult)
+
+        # Tone multiplier: energetic = shorter clips overall, calm/sentimental = longer
+        target = max(1.8, target * _trim_mult)
+
+        if total > 1:
+            phase = idx / max(1, total - 1)
+            if phase < 0.2:
+                target *= 1.10
+            elif phase > 0.8:
+                target *= 1.05
+            else:
+                target *= 0.92
+            target = max(1.8, target)
+
+        target = min(duration, target)
+
+        # ── Story-relevance duration bonus ─────────────────────────────────
+        # Clips whose visual description overlaps with the user's storyline get
+        # up to 20 % more screen time so the story's key moments breathe more.
+        if story_weight > 0.15:
+            target = min(duration, target * (1.0 + 0.20 * story_weight))
+
+        if duration <= target + 0.35:
+            return clip
+
+        # ── VISION-GUIDED TRIM (primary path) ─────────────────────────────
+        # GPT-4o has already identified the best moment and recommended a
+        # trim window. Use it directly when it covers at least half the
+        # target duration — it's a better signal than any heuristic.
+        if vision_trim_start is not None and vision_trim_end is not None:
+            vts = max(0.0, float(vision_trim_start))
+            vte = min(duration, float(vision_trim_end))
+            v_window = vte - vts
+            if v_window >= target * 0.5:
+                # If the vision window is longer than target, centre on it
+                if v_window > target:
+                    center = (vts + vte) / 2.0
+                    half   = target / 2.0
+                    vts = max(0.0, center - half)
+                    vte = min(duration, vts + target)
+                return apply_without_mask(apply_subclip(clip, vts, vte))
+
+        # ── BEST-MOMENT ANCHOR (secondary path) ───────────────────────────
+        # No valid window but we have the peak frame timestamp.
+        # Centre the heuristic search window around it instead of scanning all.
+        if best_moment_sec is not None:
+            bm = float(best_moment_sec)
+            bm = max(0.0, min(duration - target, bm - target / 2.0))
+            bm_end = min(duration, bm + target)
+            if bm_end - bm >= target * 0.75:
+                return apply_without_mask(apply_subclip(clip, bm, bm_end))
+
+        def _content_window_start() -> Optional[float]:
+            # Pick the most informative window using lightweight motion + audio activity.
+            max_start_local = max(0.0, duration - target)
+            if max_start_local <= 0.01:
+                return 0.0
+
+            # Use a coarse scan — 3 sample frames per candidate is enough to
+            # distinguish active from static windows. Fewer frames = less RAM.
+            step = max(0.8, min(2.0, target / 3.0))
+            candidates = np.arange(0.0, max_start_local + 1e-6, step)
+            sample_count = int(max(3, min(5, round(target * 0.8))))
+            offsets = np.linspace(0.0, max(0.05, target - 0.05), sample_count)
+
+            best_score = -1.0
+            best_start_local = None
+
+            for cand_start in candidates:
+                motion_vals = []
+                audio_vals = []
+                for off in offsets:
+                    t1 = min(duration - 0.06, float(cand_start + off))
+                    t2 = min(duration - 0.01, t1 + 0.05)
+                    if t2 <= t1:
+                        continue
+                    try:
+                        f1 = np.asarray(clip.get_frame(t1), dtype=np.float32)
+                        f2 = np.asarray(clip.get_frame(t2), dtype=np.float32)
+                        if f1.ndim == 3:
+                            f1 = np.mean(f1, axis=2)
+                        if f2.ndim == 3:
+                            f2 = np.mean(f2, axis=2)
+                        motion = float(np.mean(np.abs(f2 - f1)) / 255.0)
+                        motion_vals.append(motion)
+                    except Exception:
+                        pass
+
+                    try:
+                        if getattr(clip, "audio", None) is not None:
+                            sample = np.asarray(clip.audio.get_frame(t1), dtype=np.float32)
+                            audio_vals.append(float(np.mean(np.abs(sample))))
+                    except Exception:
+                        pass
+
+                if not motion_vals and not audio_vals:
+                    continue
+
+                motion_score = float(np.mean(motion_vals)) if motion_vals else 0.0
+                audio_score = float(np.mean(audio_vals)) if audio_vals else 0.0
+
+                # Keep tiny preference away from dead starts/ends.
+                center = cand_start + (target * 0.5)
+                center_norm = center / max(0.001, duration)
+                center_bonus = 1.0 - abs(center_norm - 0.5)
+
+                # Story proximity bonus: if a peak moment is known and this
+                # clip is story-relevant, prefer windows that include it.
+                story_bonus = 0.0
+                if story_weight > 0.05 and best_moment_sec is not None:
+                    win_start = float(cand_start)
+                    win_end   = win_start + target
+                    dist = 0.0 if win_start <= best_moment_sec <= win_end \
+                           else min(abs(best_moment_sec - win_start),
+                                    abs(best_moment_sec - win_end))
+                    story_bonus = story_weight * max(0.0, 1.0 - dist / max(1.0, target))
+
+                total_score = (_motion_w * motion_score) + (_audio_w * audio_score) + (0.08 * center_bonus) + (0.15 * story_bonus)
+
+                if total_score > best_score:
+                    best_score = total_score
+                    best_start_local = float(cand_start)
+
+            return best_start_local
+
+        # First try true content-aware cutting.
+        try:
+            smart_start = _content_window_start()
+            if smart_start is not None:
+                smart_end = min(duration, smart_start + target)
+                smart_clip = apply_subclip(clip, smart_start, smart_end)
+                return apply_without_mask(smart_clip)
+        except Exception:
+            pass
+
+        max_start = max(0.0, duration - target)
+        if total <= 1:
+            start_t = max_start * 0.25
+        elif idx == 0:
+            # Opening clip: bias to earlier moment.
+            start_t = max_start * 0.12
+        elif idx == total - 1:
+            # Closing clip: bias to later moment.
+            start_t = max_start * 0.72
+        else:
+            # Middle clips: move through source progressively.
+            progression = idx / max(1, total - 1)
+            start_t = max_start * (0.22 + 0.46 * progression)
+
+        end_t = min(duration, start_t + target)
+        trimmed = apply_subclip(clip, start_t, end_t)
+        return apply_without_mask(trimmed)
+
+    def load_clip(path):
         try:
             clip = VideoFileClip(path)
             if not clip.duration or clip.duration < MIN_KEEP_SEC:
@@ -202,14 +550,40 @@ def generate_video(
         except Exception:
             return None
 
+    import gc
+
     # Normalize clip paths
     clip_paths = normalize_clip_paths(clip_paths)
 
-    # Parallel load
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        loaded = list(executor.map(load_clip, clip_paths))
-    clips = [c for c in loaded if c is not None]
-    load_failures = [p for p, c in zip(clip_paths, loaded) if c is None]
+    # ── Load + trim one clip at a time ──────────────────────────────────────
+    # Loading all clips in parallel peaks at (n_clips × clip_RAM). Instead we
+    # load one, trim it immediately (so the full source is no longer needed),
+    # close the original, and only keep the small trimmed version. Peak RAM
+    # stays at ~1 clip rather than all clips simultaneously.
+    _meta = clip_metadata or {}
+    clips: list = []
+    load_failures: list = []
+    _deferred_close: list = []  # raw clips to close AFTER beat alignment
+    n_paths = len(clip_paths)
+    for i, path in enumerate(clip_paths):
+        raw = load_clip(path)
+        if raw is None:
+            load_failures.append(path)
+            continue
+        trimmed = apply_smart_trim(
+            raw, i, n_paths,
+            role             = _meta.get(path, {}).get("narrative_role", "development"),
+            vision_trim_start= _meta.get(path, {}).get("trim_start_sec"),
+            vision_trim_end  = _meta.get(path, {}).get("trim_end_sec"),
+            best_moment_sec  = _meta.get(path, {}).get("best_moment_sec"),
+            story_weight     = _story_weight(path),
+        )
+        # Defer closing raw — subclips still hold a reference to raw's reader.
+        # Closing raw now would NoneType the reader before beat alignment runs.
+        if trimmed is not raw:
+            _deferred_close.append(raw)
+        clips.append(trimmed)
+        gc.collect()  # release frame buffers before loading the next clip
 
     if not clips:
         # Give you useful info instead of the generic ValueError
@@ -233,8 +607,43 @@ def generate_video(
         total_clip_duration = sum(c.duration for c in clips)
         beat_times = [b for b in beat_times if b < total_clip_duration]
 
-    # --- Adaptive transitions, beat-aligned if possible ---
+    # --- Adaptive transitions, metadata-driven ---
     available_transitions = list_available_transitions()
+
+    def _pick_transition(path: str) -> str:
+        """
+        Choose transition blending tone-level bias with per-clip visual metadata.
+        Tone defines the character of the edit; clip metadata refines individual cuts.
+        """
+        meta = _meta.get(path, {})
+        shot  = (meta.get("shot_type", "") or "").lower()
+        emo   = (meta.get("emotion",   "") or "").lower()
+        role  = (meta.get("narrative_role", "") or "").lower()
+
+        # Narrative role overrides everything (same for all tones)
+        if role == "hook":
+            if _tone_key in ("energetic", "epic"):
+                return random.choice(["zoom_in", "slide_left", "slide_right"])
+            return random.choice(["zoom_in", "crossfade"])
+        if role == "payoff":
+            if _tone_key in ("sentimental", "calm"):
+                return random.choice(["fadein", "crossfade"])
+            return random.choice(["zoom_out", "fadein", "crossfade"])
+
+        # Clip-level emotion/shot considered in the context of tone
+        if emo in ("exciting", "dramatic") or shot == "action":
+            # Even in a calm edit, action clips get something kinetic
+            pool = ["slide_left", "slide_right", "zoom_in"] if _tone_key in ("calm", "sentimental") \
+                   else _tone_transition_pool
+            return random.choice(pool)
+        if shot in ("talking_head", "close_up") or emo in ("calm", "sad", "inspiring"):
+            # In energetic edits, even dialogue clips get a slide
+            pool = ["crossfade", "fadein"] if _tone_key not in ("energetic", "epic") \
+                   else ["slide_left", "slide_right"]
+            return random.choice(pool)
+
+        # Default: use tone's preferred pool
+        return random.choice(_tone_transition_pool)
 
     def transition_for_pair(a, b) -> float:
         # At most 20% of the shorter clip
@@ -252,16 +661,19 @@ def generate_video(
             if i < len(cut_points)-1:
                 start = cut_points[i]
                 end = cut_points[i+1]
-                if end > start and c.duration > (end-start):
-                    clips[i] = c.subclip(0, end-start)
+                beat_len = end - start
+                if beat_len > 0 and c.duration > beat_len:
+                    clips[i] = apply_subclip(c, 0, beat_len)
+
+    # Safe to close raw clips now — beat alignment (the last reader-dependent
+    # operation on trimmed subclips) is complete.
+    # NOTE: _deferred_close raws are kept alive through the entire lazy pipeline
+    # (beat align → fades → transitions → concat → write). Closed in finally below.
 
     # First clip fade
     first_fade = min(IDEAL_TRANSITION, 0.25 * clips[0].duration)
     first_fade = first_fade if first_fade >= 0.12 else 0.0
-    final_clips: List["VideoFileClip"] = [clips[0].fadein(first_fade) if first_fade else clips[0]]
-
-    # Per-cut paddings
-    paddings: List[float] = []
+    final_clips: List["VideoFileClip"] = [apply_fadein(clips[0], first_fade)]
 
     for i in range(1, len(clips)):
         prev = final_clips[-1]
@@ -269,16 +681,14 @@ def generate_video(
         tdur = transition_for_pair(prev, nxt)
 
         if tdur > 0 and available_transitions:
-            transition = random.choice(available_transitions)
+            transition = _pick_transition(clip_paths[i] if i < len(clip_paths) else "")
             try:
                 transitioned = apply_transition(prev, nxt, transition, tdur)
-                final_clips[-1] = transitioned.set_end(transitioned.duration)
+                final_clips[-1] = apply_without_mask(apply_end(transitioned, transitioned.duration))
 
                 fade_next = min(tdur, 0.25 * nxt.duration)
                 fade_next = fade_next if fade_next >= 0.12 else 0.0
-                final_clips.append(nxt.fadein(fade_next) if fade_next else nxt)
-
-                paddings.append(-tdur)
+                final_clips.append(apply_without_mask(apply_fadein(nxt, fade_next)))
                 continue
             except Exception as e:
                 print(f"⚠️ Transition failed ({transition}) at clip {i}: {repr(e)}")
@@ -286,59 +696,81 @@ def generate_video(
         # fallback: no transition (or tiny fade)
         fade_next = min(0.12, 0.15 * nxt.duration)
         fade_next = fade_next if fade_next >= 0.08 else 0.0
-        final_clips.append(nxt.fadein(fade_next) if fade_next else nxt)
-        paddings.append(0.0)
+        final_clips.append(apply_without_mask(apply_fadein(nxt, fade_next)))
 
-    # Use method='chain' if all clips have same size/fps
-    same_size = all((c.size == clips[0].size and c.fps == clips[0].fps) for c in clips)
-    concat_method = "chain" if same_size else "compose"
-    final = concatenate_videoclips(final_clips, method=concat_method, padding=paddings)
-
-    # --- Validate all clips before render ---
-    for idx, c in enumerate(clips):
+    # --- Validate final_clips BEFORE concatenation so errors are readable ---
+    for idx, c in enumerate(final_clips):
         if not hasattr(c, 'duration') or not hasattr(c, 'fps') or not hasattr(c, 'size'):
-            raise ValueError(f"Clip {idx} is missing required attributes (duration, fps, size).")
-        if c.duration is None or c.duration < 0.1:
-            raise ValueError(f"Clip {idx} has invalid duration: {c.duration}")
+            raise ValueError(f"final_clips[{idx}] is missing required attributes (duration, fps, size).")
+        if c.duration is None or c.duration < 0.05:
+            raise ValueError(f"final_clips[{idx}] has invalid duration: {c.duration}")
         if c.fps is None or c.fps < 1:
-            raise ValueError(f"Clip {idx} has invalid fps: {c.fps}")
+            raise ValueError(f"final_clips[{idx}] has invalid fps: {c.fps}")
         if not c.size or not isinstance(c.size, (tuple, list)) or len(c.size) != 2:
-            raise ValueError(f"Clip {idx} has invalid size: {c.size}")
+            raise ValueError(f"final_clips[{idx}] has invalid size: {c.size}")
+
+    # Use method='chain' if all final_clips have the same size/fps
+    same_size = all(
+        (getattr(c, "size", None) == getattr(final_clips[0], "size", None)
+         and getattr(c, "fps", None) == getattr(final_clips[0], "fps", None))
+        for c in final_clips
+    )
+    concat_method = "chain" if same_size else "compose"
+    final = concatenate_videoclips(final_clips, method=concat_method, padding=0.0)
+    final = apply_without_mask(final)
+
+    if target_duration_sec and float(getattr(final, "duration", 0.0) or 0.0) > float(target_duration_sec) + 0.2:
+        final = apply_subclip(final, 0.0, float(target_duration_sec))
 
     # Optional opening card
     if show_opening_card and (tone or "").lower() == "cinematic":
         overlays = []
         try:
-            overlays.append(
-                TextClip(
+            # Build a TextClip compatible with both MoviePy v1 and v2
+            try:
+                tc = TextClip(
+                    text="KEEMOGRAPHY PRESENTS",
+                    font_size=70,
+                    color="white",
+                    font="Arial-Bold",
+                )
+                tc = tc.with_duration(3).with_position("center")
+            except (TypeError, AttributeError):
+                tc = TextClip(
                     "KEEMOGRAPHY PRESENTS",
                     fontsize=70,
                     color="white",
                     font="Arial-Bold",
-                )
-                .set_duration(3)
-                .set_position("center")
-                .fadein(0.5)
-                .fadeout(0.5)
-            )
+                ).set_duration(3).set_position("center")
+            overlays.append(tc)
+            overlays[-1] = apply_fadein(overlays[-1], 0.5)
+            overlays[-1] = apply_fadeout(overlays[-1], 0.5)
         except Exception as e:
-            print(f"ℹ️ Skipping TextClip overlay (likely missing ImageMagick): {repr(e)}")
+            print(f"ℹ️ Skipping TextClip overlay (likely missing ImageMagick/font): {repr(e)}")
             overlays = []
 
         if overlays:
             final = CompositeVideoClip([final] + overlays)
+            final = apply_without_mask(final)
 
     # Background music
     music_path = None
     if custom_music_path and os.path.exists(custom_music_path):
-        music_path = custom_music_path
+        normalized_custom = normalize_audio_for_mix(custom_music_path)
+        music_path = normalized_custom or custom_music_path
     else:
         music_path = _get_music_for_tone(tone)
     bg_music_clip = None
     if music_path and os.path.exists(music_path):
         try:
-            bg_music_clip = AudioFileClip(music_path).volumex(0.2)
-            bg_music_clip = bg_music_clip.subclip(0, min(bg_music_clip.duration, final.duration))
+            bg_music_clip = AudioFileClip(music_path)
+            bg_music_clip = apply_audio_volume(bg_music_clip, _music_vol)
+
+            # Fit music to final duration (loop when too short, trim when too long).
+            if bg_music_clip.duration < final.duration:
+                loops = int(final.duration // max(0.1, bg_music_clip.duration)) + 1
+                bg_music_clip = concatenate_audioclips([bg_music_clip] * max(1, loops))
+            bg_music_clip = apply_audio_subclip(bg_music_clip, 0, min(bg_music_clip.duration, final.duration))
         except Exception as e:
             print(f"⚠️ Could not load background music: {repr(e)}")
             bg_music_clip = None
@@ -348,28 +780,42 @@ def generate_video(
         if bg_music_clip and final.audio is not None:
             if mix_original_audio:
                 mixed = CompositeAudioClip([
-                    final.audio.volumex(1.0),
-                    bg_music_clip.volumex(0.15),
+                    apply_audio_volume(final.audio, 1.0),
+                    apply_audio_volume(bg_music_clip, 0.20),
                 ])
-                final = final.set_audio(mixed)
+                final = apply_set_audio(final, mixed)
             else:
-                final = final.set_audio(bg_music_clip)
+                final = apply_set_audio(final, bg_music_clip)
         elif bg_music_clip and final.audio is None:
-            final = final.set_audio(bg_music_clip)
+            final = apply_set_audio(final, bg_music_clip)
     except Exception as e:
         print(f"⚠️ Audio mix failed, keeping existing audio: {repr(e)}")
+
+    # Final hard target enforcement (trim or extend so output matches requested length).
+    final = enforce_target_duration(final, target_duration_sec)
 
     # Write output
     temp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     try:
-        final.write_videofile(
-            temp_out.name,
-            codec="h264_videotoolbox",  # Use hardware-accelerated encoding on macOS
-            audio_codec="aac",
-            fps=24,
-            threads=2,
-            preset="medium",
-        )
+        try:
+            # Try hardware-accelerated encoding on macOS (h264_videotoolbox); no 'preset' param
+            final.write_videofile(
+                temp_out.name,
+                codec="h264_videotoolbox",
+                audio_codec="aac",
+                fps=_fps,
+                threads=2,
+            )
+        except Exception as hw_err:
+            print(f"⚠️ Hardware encoding unavailable ({hw_err}), falling back to libx264...")
+            final.write_videofile(
+                temp_out.name,
+                codec="libx264",
+                audio_codec="aac",
+                fps=_fps,
+                threads=2,
+                preset="medium",
+            )
     except Exception as e:
         print(f"❌ Failed to write video file: {repr(e)}")
         raise
@@ -383,6 +829,14 @@ def generate_video(
                 c.close()
             except Exception:
                 pass
+        # Close raw source clips now — write_videofile is done so the lazy
+        # reader chain is no longer needed.
+        for _raw in _deferred_close:
+            try:
+                _raw.close()
+            except Exception:
+                pass
+        _deferred_close.clear()
         if bg_music_clip:
             try:
                 bg_music_clip.close()
