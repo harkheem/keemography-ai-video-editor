@@ -23,6 +23,8 @@ __pycache__/
 *.exe
 venv*/
 venv*/lib/python*/site-packages/
-
+.venv*/
 .venv/
 venv311/
+node_modules/
+frontend/node_modules/

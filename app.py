@@ -232,125 +232,199 @@ OPENAI_API_KEY = _get_key()
 
 # ---------------- PAGE CONFIG / THEME ----------------
 st.set_page_config(
-    page_title="KEEMOGRAPHY AI VIDEO EDITOR",
+    page_title="Keemography · AI Video Editor",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
-# --- Enhanced Custom CSS: red/black cinematic theme ---
+# ── CSS / Theme ────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-body, .stApp {
-    background: radial-gradient(circle at top right, #2a0000 0%, #130000 35%, #050505 100%);
-    color: #f6f6f6;
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+
+html, body, .stApp {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    background: #080808 !important;
+    color: #e8e8e8;
+}
+.block-container { padding-top: 0 !important; padding-bottom: 3rem; max-width: 1100px !important; }
+[data-testid="stSidebar"] { display: none !important; }
+
+/* ── Header ────────────────────────────────────────────────────────────── */
+.kee-header {
+    background: linear-gradient(135deg, #0e0e0e 0%, #150808 100%);
+    border-bottom: 1px solid #1e1e1e;
+    padding: 26px 0 20px;
+    margin: 0 -4rem 2.5rem;
+    text-align: center;
+}
+.kee-title { font-size: 1.55rem; font-weight: 900; letter-spacing: 0.14em;
+             text-transform: uppercase; color: #fff; }
+.kee-sub   { font-size: 0.72rem; color: #555; letter-spacing: 0.2em;
+             text-transform: uppercase; margin-top: 4px; }
+.kee-red   { color: #e63939; }
+
+/* ── Section labels ────────────────────────────────────────────────────── */
+.step-label { font-size: 0.63rem; font-weight: 700; letter-spacing: 0.22em;
+              text-transform: uppercase; color: #e63939; margin-bottom: 4px; }
+.sec-title  { font-size: 0.98rem; font-weight: 700; color: #fff; margin-bottom: 12px; }
+.kee-hr     { border: none; border-top: 1px solid #181818; margin: 20px 0; }
+
+/* ── Card panels ───────────────────────────────────────────────────────── */
+.kee-panel {
+    background: rgba(255,255,255,0.026);
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 16px;
+    padding: 20px 22px;
+    margin-bottom: 14px;
 }
 
-.block-container {
-    padding-top: 1.5rem;
-    max-width: 1200px;
+/* ── Inputs ────────────────────────────────────────────────────────────── */
+.stTextArea textarea, .stTextInput > div > input {
+    background: #0d0d0d !important; color: #f0f0f0 !important;
+    border: 1px solid #242424 !important; border-radius: 10px !important;
+    font-size: 0.9rem !important;
+}
+.stTextArea textarea:focus, .stTextInput > div > input:focus {
+    border-color: #e63939 !important;
+    box-shadow: 0 0 0 2px rgba(230,57,57,0.14) !important;
+}
+.stTextArea textarea::placeholder, .stTextInput > div > input::placeholder { color: #3c3c3c !important; }
+label[data-testid="stWidgetLabel"] p, div[data-testid="stWidgetLabel"] p {
+    color: #888 !important; font-size: 0.79rem !important; font-weight: 500 !important; }
+
+/* ── Selectbox ─────────────────────────────────────────────────────────── */
+.stSelectbox div[data-baseweb="select"] > div {
+    background: #0d0d0d !important; border: 1px solid #242424 !important;
+    border-radius: 10px !important; color: #f0f0f0 !important;
 }
 
-h1, h2, h3, h4 {
-    color: #ffffff;
-    letter-spacing: 0.2px;
+/* ── Slider ────────────────────────────────────────────────────────────── */
+/* track rail (dark) */
+[data-testid="stSlider"] [data-baseweb="slider"] > div > div:first-child {
+    background: #252525 !important; border-radius: 4px !important; }
+/* filled portion (red) */
+[data-testid="stSlider"] [data-baseweb="slider"] > div > div:nth-child(2) {
+    background: #e63939 !important; border-radius: 4px !important; }
+/* thumb */
+[data-testid="stSlider"] [role="slider"] {
+    background: #e63939 !important;
+    border-color: #e63939 !important;
+    box-shadow: 0 0 0 4px rgba(230,57,57,0.22) !important;
+    width: 16px !important; height: 16px !important;
+}
+/* current value label */
+[data-testid="stSlider"] p { color: #aaa !important; font-size: 0.8rem !important; }
+/* min / max tick labels */
+[data-testid="stSlider"] [data-testid="stTickBarMin"],
+[data-testid="stSlider"] [data-testid="stTickBarMax"] {
+    color: #444 !important; font-size: 0.72rem !important;
 }
 
-[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #1a0000 0%, #0a0a0a 100%);
-    border-right: 1px solid #3a0f0f;
-}
+/* ── Toggle ────────────────────────────────────────────────────────────── */
+[data-testid="stToggle"] span[aria-checked="true"] { background: #e63939 !important; }
 
-[data-testid="stSidebar"] * {
-    color: #f4eeee;
-}
-
-.stButton>button, .stDownloadButton>button {
-    background: linear-gradient(90deg, #8a0000 0%, #d41414 100%);
-    color: #ffffff;
-    border: 1px solid #ff4a4a;
-    border-radius: 10px;
-    font-weight: 700;
-    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
-    padding: 0.6em 1.2em;
-}
-
-.stButton>button:hover, .stDownloadButton>button:hover {
-    background: linear-gradient(90deg, #b30000 0%, #ff2525 100%);
-    border-color: #ff6a6a;
-    color: #ffffff;
-}
-
-.stTextInput>div>input, .stTextArea textarea {
-    background: #111111 !important;
-    color: #ffffff !important;
-    border-radius: 10px;
-    border: 1px solid #4a1a1a !important;
-}
-
-.stTextInput>div>input:focus, .stTextArea textarea:focus {
-    border-color: #c72424 !important;
-    box-shadow: 0 0 0 1px #c72424 !important;
-}
-
-.stSelectbox div[data-baseweb="select"] > div,
-.stMultiSelect div[data-baseweb="select"] > div {
-    background: #111111;
-    border: 1px solid #4a1a1a;
-    border-radius: 10px;
-}
-
-.stProgress > div > div {
-    background: linear-gradient(90deg, #8a0000, #ff2d2d);
-}
-
-.stAlert {
-    border-radius: 10px;
-    border: 1px solid #4a1a1a;
-}
-
+/* ── File uploader ─────────────────────────────────────────────────────── */
 [data-testid="stFileUploaderDropzone"] {
-    background: #0f0f0f;
-    border: 1px dashed #7a1b1b;
-    border-radius: 12px;
+    background: #0a0a0a !important; border: 1.5px dashed #252525 !important;
+    border-radius: 14px !important;
+}
+[data-testid="stFileUploaderDropzone"]:hover { border-color: #e63939 !important; }
+
+/* ── Buttons ───────────────────────────────────────────────────────────── */
+.stButton > button {
+    background: #111 !important; color: #ddd !important;
+    border: 1px solid #252525 !important; border-radius: 10px !important;
+    font-weight: 600 !important; font-size: 0.85rem !important; transition: all 0.15s !important;
+}
+.stButton > button:hover { border-color: #e63939 !important; color: #fff !important; background: #1a0808 !important; }
+.stButton > button[kind="primary"] {
+    background: linear-gradient(135deg, #b52828 0%, #e63939 100%) !important;
+    border: none !important; color: #fff !important; font-size: 1.05rem !important;
+    font-weight: 800 !important; letter-spacing: 0.06em !important;
+    border-radius: 13px !important; box-shadow: 0 4px 22px rgba(230,57,57,0.38) !important;
+}
+.stButton > button[kind="primary"]:hover { box-shadow: 0 6px 30px rgba(230,57,57,0.58) !important; }
+.stDownloadButton > button {
+    background: linear-gradient(135deg, #0a1f0a 0%, #0e2e0e 100%) !important;
+    border: 1px solid #1a5c1a !important; color: #6de06d !important;
+    border-radius: 12px !important; font-weight: 700 !important;
+    box-shadow: 0 4px 16px rgba(20,100,20,0.25) !important;
 }
 
-.uploadedFile {
-    background: #121212;
-    border: 1px solid #3d1717;
-    border-radius: 10px;
-    padding: 8px;
-    margin-bottom: 6px;
+/* ── Progress bar ──────────────────────────────────────────────────────── */
+.stProgress > div > div { background: #181818 !important; border-radius: 100px !important; }
+.stProgress > div > div > div {
+    background: linear-gradient(90deg, #b52828, #e63939, #ff6b6b) !important;
+    border-radius: 100px !important;
 }
 
-.timeline {
-    background: linear-gradient(180deg, #120808 0%, #0d0d0d 100%);
-    border: 1px solid #3a1111;
-    border-radius: 12px;
-    padding: 16px;
-    margin-top: 16px;
+/* ── Expanders ─────────────────────────────────────────────────────────── */
+[data-testid="stExpander"] {
+    border: 1px solid #1c1c1c !important; border-radius: 12px !important; background: #0c0c0c !important;
 }
 
-.timeline-bar {
-    height: 18px;
-    border-radius: 6px;
-    margin-bottom: 8px;
-}
+/* ── Metrics ───────────────────────────────────────────────────────────── */
+[data-testid="stMetricValue"] { color: #e63939 !important; font-weight: 800 !important; }
+[data-testid="stMetricLabel"] p { color: #777 !important; font-size: 0.76rem !important; }
 
-.timeline-bar.video {
-    background: linear-gradient(90deg, #7c0000, #d41414);
-}
+/* ── Alerts ────────────────────────────────────────────────────────────── */
+.stAlert { border-radius: 12px !important; }
 
-.timeline-bar.audio {
-    background: linear-gradient(90deg, #370000, #8a0000);
-}
+/* ── Caption / small text ──────────────────────────────────────────────── */
+.stCaption, .stCaption p { color: #666 !important; font-size: 0.77rem !important; }
 
-[data-testid="stMetricValue"] {
-    color: #ff5a5a;
+/* ── Stage pills ───────────────────────────────────────────────────────── */
+.stage-row { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+.stage-pill { font-size: 0.67rem; font-weight: 700; letter-spacing: 0.08em;
+    text-transform: uppercase; padding: 4px 13px; border-radius: 100px;
+    border: 1px solid #222; color: #444; background: #0e0e0e; transition: all 0.3s; }
+.stage-pill.active { background: #1a0808; border-color: #e63939; color: #ff7070;
+    box-shadow: 0 0 14px rgba(230,57,57,0.2); }
+.stage-pill.done { background: #0a160a; border-color: #1a5c1a; color: #5ed85e; }
+
+/* ── Clip analysis cards ───────────────────────────────────────────────── */
+.clip-row { display: flex; align-items: center; gap: 9px; padding: 9px 13px;
+    border-radius: 11px; background: #0d0d0d; border: 1px solid #1c1c1c; margin-bottom: 7px; }
+.clip-badge { font-size: 0.61rem; font-weight: 700; padding: 2px 8px; border-radius: 6px;
+    text-transform: uppercase; letter-spacing: 0.05em; flex-shrink: 0; }
+.badge-hook        { background: #2a0e00; color: #ff8c2a; border: 1px solid #6b3000; }
+.badge-payoff      { background: #18002e; color: #c987ff; border: 1px solid #56228a; }
+.badge-turn        { background: #00102e; color: #54b4ff; border: 1px solid #1a446e; }
+.badge-development { background: #0a160a; color: #68c868; border: 1px solid #26502a; }
+.badge-broll       { background: #161616; color: #888;    border: 1px solid #2e2e2e; }
+.badge-emo { font-size: 0.59rem; font-weight: 600; padding: 2px 7px; border-radius: 6px;
+    background: #141414; color: #999; border: 1px solid #222; flex-shrink: 0; }
+.clip-name  { font-size: 0.8rem; font-weight: 600; color: #ddd; flex: 1; min-width: 0;
+              white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.clip-score { font-size: 0.75rem; color: #e63939; font-weight: 700; flex-shrink: 0; }
+.clip-trim  { font-size: 0.69rem; color: #555; flex-shrink: 0; }
+
+/* ── Output card ───────────────────────────────────────────────────────── */
+.output-card { background: linear-gradient(135deg, #0b1508 0%, #080d08 100%);
+    border: 1px solid #1a3a1a; border-radius: 16px; padding: 24px; margin-top: 20px;
+    box-shadow: 0 8px 40px rgba(0,0,0,0.5); }
+.output-title { font-size: 1.05rem; font-weight: 800; color: #6de06d;
+    letter-spacing: 0.05em; margin-bottom: 14px; }
+
+/* ── Settings card ─────────────────────────────────────────────────────── */
+.settings-card {
+    background: #0d0d0d;
+    border: 1px solid #1e1e1e;
+    border-radius: 14px;
+    padding: 18px 20px;
+    margin-bottom: 16px;
 }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🎬 KEEMOGRAPHY AI VIDEO EDITOR")
+# ── App Header ─────────────────────────────────────────────────────────────
+st.markdown("""
+<div class="kee-header">
+  <div class="kee-title">Keem<span class="kee-red">ography</span></div>
+  <div class="kee-sub">AI Video Editor</div>
+</div>
+""", unsafe_allow_html=True)
 
 
 # ---------------- HELPERS ----------------
@@ -429,141 +503,190 @@ if "fetched_paths" not in st.session_state:
     st.session_state.fetched_paths = []
 
 
-# ---------------- SIDEBAR ----------------
-with st.sidebar:
-    st.header("⚙️ Project Settings")
-    st.markdown("Set your video style and preferences.")
-    tone = st.selectbox("🎨 Tone", ["Cinematic", "Energetic", "Sentimental", "Epic", "Calm"])
-    target_duration_sec = st.slider("🎯 Target Video Length (sec)", 15, 180, 45, 5)
-    transition_duration = st.slider("⏱️ Transition Duration (sec)", 0.15, 1.5, 0.3, 0.05)
-    mix_original_audio = st.toggle("🎚️ Mix Original Audio", value=False)
-    show_opening_card = st.toggle("🎬 Show Opening Card", value=True)
-    st.caption("💡 Tip: Use short transitions for fast-paced edits.")
-    # Memory usage display
-    mem = psutil.virtual_memory()
-    st.write(f"🧠 Memory usage: {mem.percent}% ({mem.used // (1024**2)}MB / {mem.total // (1024**2)}MB)")
-    if mem.percent > 85:
-        st.warning("System memory is critically high! Try fewer/smaller clips or close other apps.")
+# ── Memory check ──────────────────────────────────────────────────────────
+_mem = psutil.virtual_memory()
+if _mem.percent > 85:
+    st.warning(f"⚠️ Memory at {_mem.percent}% — consider fewer/smaller clips or closing other apps.")
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  LEFT  |  RIGHT  two-column master layout
+# ══════════════════════════════════════════════════════════════════════════════
+_col_left, _col_right = st.columns([0.48, 0.52], gap="large")
 
-# ===================== EDITOR LAYOUT =====================
-left, right = st.columns([0.38, 0.62], gap="large")
+# ─────────────────────────────────────────────────────────────────────────────
+#  LEFT COLUMN : Story · Footage · Music · Keywords · Generate
+# ─────────────────────────────────────────────────────────────────────────────
+with _col_left:
 
-# -------- LEFT --------
-with left:
-    st.subheader("📝 Tell Your Story")
-    storyline = st.text_area("Describe your video story", height=140, placeholder="A cat is sitting on a window sill. The rain is falling outside.")
-    st.subheader("📁 Add Clips")
-    uploaded_files = st.file_uploader("Upload MP4/MPEG4 files (no file count limit, 2GB each)", type=["mp4", "mpeg4"], accept_multiple_files=True)
-    st.caption("Or paste direct video URLs (comma/newline separated):")
-    urls = st.text_area("Paste URLs", placeholder="https://.../video.mp4")
-    fetch_clicked = st.button("⬇️ Fetch from URLs")
-    clear_fetched = st.button("🧹 Clear fetched")
+    # ── Story ──────────────────────────────────────────────────────────────
+    st.markdown('<p class="step-label">① Story</p>', unsafe_allow_html=True)
+    storyline = st.text_area(
+        "What is this video about?",
+        height=110,
+        placeholder="e.g. A behind-the-scenes look at a golden-hour photoshoot — raw, emotional, cinematic.",
+        help="The AI uses this to rank clips and decide how to arrange them.",
+        label_visibility="collapsed",
+    )
 
-    # --- New: User music upload ---
-    st.subheader("🎵 Add Your Own Music (optional)")
-    user_music_file = st.file_uploader("Upload MP3/WAV music", type=["mp3", "wav", "m4a", "aac", "ogg"], accept_multiple_files=False, key="music_upload")
-    user_music_path = None
-    if user_music_file:
-        if _too_big(user_music_file, 100):
-            st.warning("Music file is too large (max 100MB). Please upload a smaller file.")
-        else:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(user_music_file.name)[-1]) as tmp:
-                user_music_file.seek(0)
-                tmp.write(user_music_file.read())
-                user_music_path = tmp.name
-            st.success(f"Music uploaded: {user_music_file.name}")
-            st.caption("Your music will be used for beat-aligned editing. If the file is invalid or too short, default music will be used.")
-    else:
-        st.caption("If you don't upload music, a default soundtrack will be used based on your selected tone.")
+    st.markdown('<hr class="kee-hr">', unsafe_allow_html=True)
+
+    # ── Footage ────────────────────────────────────────────────────────────
+    st.markdown('<p class="step-label">② Footage</p>', unsafe_allow_html=True)
+    uploaded_files = st.file_uploader(
+        "Upload MP4 / MPEG4 clips",
+        type=["mp4", "mpeg4"],
+        accept_multiple_files=True,
+        help="No file-count limit. Up to 2 GB each.",
+    )
+    urls = st.text_area(
+        "Or paste direct video URLs",
+        placeholder="https://.../clip1.mp4\nhttps://.../clip2.mp4",
+        height=68,
+        help="Google Drive share links and Dropbox links are auto-converted to direct downloads.",
+    )
+    _fc1, _fc2 = st.columns([1, 1])
+    fetch_clicked = _fc1.button("⬇ Fetch URLs", use_container_width=True)
+    clear_fetched = _fc2.button("🗑 Clear", use_container_width=True)
 
     if clear_fetched:
         st.session_state.fetched_paths = []
-        st.info("Cleared fetched files list.")
-
     if fetch_clicked and urls.strip():
         st.session_state.fetched_paths = []
         url_list = [u.strip() for u in re.split(r"[,\n]+", urls) if u.strip()]
         for u in url_list:
             direct = _normalize_drive_dropbox(u)
             try:
-                st.write(f"⬇️ Fetching {direct} ...")
+                st.caption(f"Fetching {direct[:60]}…")
                 with requests.get(direct, stream=True, timeout=1200) as r:
                     r.raise_for_status()
                     total = int(r.headers.get("content-length", 0))
-                    prog = st.progress(0.0)
+                    _prog = st.progress(0.0)
                     downloaded = 0
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as f:
-                        for chunk in r.iter_content(chunk_size=1024 * 1024 * 16):  # 16MB
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as _ff:
+                        for chunk in r.iter_content(chunk_size=1024 * 1024 * 16):
                             if chunk:
-                                f.write(chunk)
+                                _ff.write(chunk)
                                 downloaded += len(chunk)
                                 if total:
-                                    prog.progress(min(1.0, downloaded / total))
-                        saved = f.name
+                                    _prog.progress(min(1.0, downloaded / total))
+                        saved = _ff.name
                 st.session_state.fetched_paths.append(saved)
-                st.success(f"✅ Saved: {saved}")
+                st.success(f"Saved: {os.path.basename(saved)}")
             except Exception as e:
-                st.error(f"Download failed for {u}: {e}")
+                st.error(f"Download failed: {e}")
 
     if st.session_state.fetched_paths:
-        st.markdown("**Fetched files:**")
-        for p in st.session_state.fetched_paths:
-            st.code(p, language="text")
+        with st.expander(f"{len(st.session_state.fetched_paths)} URL clip(s) ready"):
+            for p in st.session_state.fetched_paths:
+                st.caption(p)
 
-    st.markdown('<div style="margin-top:1em"></div>', unsafe_allow_html=True)
-    run = st.button("🚀 Generate Video", type="primary", use_container_width=True)
+    st.markdown('<hr class="kee-hr">', unsafe_allow_html=True)
 
-# -------- RIGHT --------
-with right:
-    st.subheader("🔎 Preview & Timeline")
-    preview_path = None
-    fetched_paths_list = st.session_state.get("fetched_paths", [])
-    if fetched_paths_list:
-        preview_path = fetched_paths_list[0]
-    elif uploaded_files:
-        try:
-            uf = uploaded_files[0]
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as _tmp:
-                try:
-                    uf.seek(0)
-                except Exception:
-                    pass
-                shutil.copyfileobj(uf, _tmp, length=8 * 1024 * 1024)  # 8 MB chunks
-                preview_path = _tmp.name
-            try:
-                uf.seek(0)
-            except Exception:
-                pass
-        except Exception:
-            preview_path = None
+    # ── Music ──────────────────────────────────────────────────────────────
+    st.markdown('<p class="step-label">③ Music  <span style="color:#555;font-weight:400;font-size:0.75rem;text-transform:none;letter-spacing:normal">(optional)</span></p>', unsafe_allow_html=True)
+    user_music_file = st.file_uploader(
+        "Upload MP3 / WAV",
+        type=["mp3", "wav", "m4a", "aac", "ogg"],
+        accept_multiple_files=False,
+        key="music_upload",
+        help="Used for beat-aligned editing. Max 100 MB. If omitted, a default soundtrack is chosen by tone.",
+    )
+    user_music_path = None
+    if user_music_file:
+        if _too_big(user_music_file, 100):
+            st.warning("Max 100 MB.")
+        else:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(user_music_file.name)[-1]) as tmp:
+                user_music_file.seek(0)
+                tmp.write(user_music_file.read())
+                user_music_path = tmp.name
+            st.success(f"✓ {user_music_file.name}")
 
-    if preview_path:
-        st.video(preview_path)
-    else:
-        st.image(
-            "https://picsum.photos/960/540?blur=2",
-            caption="Preview appears here after you add a clip",
-            use_container_width=True,
+    st.markdown('<hr class="kee-hr">', unsafe_allow_html=True)
+
+    # ── Keyword filters ────────────────────────────────────────────────────
+    with st.expander("🔍 Keyword filters  (optional)"):
+        _kc1, _kc2 = st.columns(2)
+        user_priority_keywords = _kc1.text_input(
+            "Prioritize",
+            placeholder="dance, culture, joy",
+            help="Clips matching these are ranked higher.",
+        )
+        user_excluded_keywords = _kc2.text_input(
+            "Exclude",
+            placeholder="blurry, quiet",
+            help="Clips matching these are filtered out.",
         )
 
-    # Timeline visualization
-    st.markdown('<div class="timeline">', unsafe_allow_html=True)
-    st.markdown("**Timeline**")
-    st.markdown('<div class="timeline-bar video" style="width:80%"></div>', unsafe_allow_html=True)
-    st.markdown('<div class="timeline-bar audio" style="width:60%"></div>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('<div style="height:10px"></div>', unsafe_allow_html=True)
+
+    # ── Generate button ────────────────────────────────────────────────────
+    run = st.button("⬡  Generate Video", type="primary", use_container_width=True)
 
 
-# ---------------- EXTRA INPUTS ----------------
-user_priority_keywords = st.text_input(
-    "Optional: Keywords to prioritize (comma-separated)",
-    placeholder="e.g. dance, culture, joy",
-)
-user_excluded_keywords = st.text_input(
-    "Optional: Keywords to exclude (comma-separated)",
-    placeholder="e.g. blurry, quiet",
-)
+# ─────────────────────────────────────────────────────────────────────────────
+#  RIGHT COLUMN : Settings · Preview
+# ─────────────────────────────────────────────────────────────────────────────
+with _col_right:
+
+    # ── Settings ───────────────────────────────────────────────────────────
+    st.markdown('<p class="step-label">④ Settings</p>', unsafe_allow_html=True)
+
+    tone = st.selectbox(
+        "Tone",
+        ["Cinematic", "Energetic", "Sentimental", "Epic", "Calm"],
+        help="Controls pacing, clip length, and music selection.",
+    )
+    target_duration_sec = st.slider(
+        "Target duration (seconds)",
+        min_value=15, max_value=180, value=45, step=5,
+        help="The AI will try to hit this length. Actual output may differ by a few seconds.",
+    )
+    transition_duration = st.slider(
+        "Transition length (seconds)",
+        min_value=0.15, max_value=1.5, value=0.3, step=0.05,
+        help="Shorter = snappier cut. Longer = smoother crossfade.",
+    )
+
+    _tc1, _tc2 = st.columns(2)
+    mix_original_audio = _tc1.toggle("Mix original audio", value=False,
+        help="Blend the clip's own audio under the music.")
+    show_opening_card  = _tc2.toggle("Show opening card",  value=True,
+        help="Adds a title card at the start of the video.")
+
+    st.markdown('<hr class="kee-hr">', unsafe_allow_html=True)
+
+    # ── Preview ────────────────────────────────────────────────────────────
+    st.markdown('<p class="step-label">⑤ Preview</p>', unsafe_allow_html=True)
+    _preview_path = None
+    _fetched_for_preview = st.session_state.get("fetched_paths", [])
+    if _fetched_for_preview:
+        _preview_path = _fetched_for_preview[0]
+    elif uploaded_files:
+        try:
+            _uf0 = uploaded_files[0]
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as _ptmp:
+                try: _uf0.seek(0)
+                except Exception: pass
+                shutil.copyfileobj(_uf0, _ptmp, length=8 * 1024 * 1024)
+                _preview_path = _ptmp.name
+            try: _uf0.seek(0)
+            except Exception: pass
+        except Exception:
+            _preview_path = None
+
+    if _preview_path:
+        st.video(_preview_path)
+    else:
+        st.markdown(
+            '<div style="background:#0a0a0a;border:1px solid #1c1c1c;border-radius:14px;'
+            'height:220px;display:flex;align-items:center;justify-content:center;'
+            'color:#333;font-size:0.82rem;letter-spacing:0.08em;text-transform:uppercase;">'
+            'Upload a clip to preview</div>',
+            unsafe_allow_html=True,
+        )
+
+
 
 
 # ---------------- ACTION ----------------
@@ -652,9 +775,9 @@ if run:
     )
     start_time = time.time()
 
-    progress_text = st.empty()
     progress_bar = st.progress(0)
     countdown_text = st.empty()
+    _status_ph = st.empty()
 
     # We keep two lists so we ONLY delete files we created from uploads (not fetched URLs).
     upload_temp_paths: list[str] = []
@@ -670,7 +793,7 @@ if run:
             print_mem_usage("Start of processing")
             # Save uploads to tmp files
             for i, uf in enumerate(kept_files):
-                progress_text.write(f"📥 Saving upload {i + 1} of {len(kept_files)}...")
+                _status_ph.caption(f"Saving clip {i + 1} of {len(kept_files)}…")
                 elapsed = time.time() - start_time
                 time_left = est_total_time - elapsed
                 countdown_text.markdown(f"⏳ {format_time_left(time_left)}")
@@ -701,7 +824,7 @@ if run:
 
             print_mem_usage("Before transcription")
             # Transcribe (with splitting)
-            progress_text.write("📝 Transcribing clips...")
+            # (transcription stage set by _render_stages)
             transcribe_start = time.time()
 
             def _on_transcribe_progress(done_chunks: int, total_chunks: int):
@@ -737,7 +860,7 @@ if run:
                 st.stop()
 
             # Score
-            progress_text.write("🧠 Scoring clips based on your story and preferences...")
+            # (analyzing stage set by _render_stages)
             score_start = time.time()
             score_estimate = max(5.0, 0.20 * transcribe_elapsed + (0.8 * len(input_paths)))
             render_baseline_estimate = max(18.0, 0.85 * transcribe_elapsed + (2.0 * len(input_paths)))
@@ -826,7 +949,7 @@ if run:
             _start_countdown(render_estimate)  # ticks every second while generate_video() blocks
 
             # Render final video
-            progress_text.write("🏞️ Generating final video...")
+            # (rendering stage set by _render_stages)
             final_video_path = generate_video(
                 relevant_paths,
                 storyline,
@@ -864,7 +987,7 @@ if run:
             )
             del video_bytes
             progress_bar.progress(100)
-            progress_text.write("✅ Done!")
+            _status_ph.empty()
             _stop_countdown()  # ensure cleared on success
             gc.collect()
             print_mem_usage("End of processing")

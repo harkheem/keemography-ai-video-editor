@@ -192,6 +192,7 @@ _VISUAL_DEFAULT: Dict = {
     "best_moment_sec": None,
     "trim_start_sec": None,
     "trim_end_sec": None,
+    "segments": [],   # populated for clips > 20 s with 2+ distinct good windows
 }
 
 
@@ -255,6 +256,16 @@ def _describe_clip_visually(
                             "Aim for a natural ending — a beat, cut point, or composition change. "
                             "Must be <= clip_duration_sec."
                         ),
+                        "segments": (
+                            "ONLY include when clip_duration_sec > 20 AND there are 2 or 3 genuinely "
+                            "distinct, high-quality sections separated by gaps of 3+ seconds. "
+                            "Array of objects, each: {start_sec: float, end_sec: float, "
+                            "narrative_role: hook|development|turn|payoff|broll, "
+                            "emotion: exciting|calm|tense|happy|sad|inspiring|neutral|dramatic, "
+                            "visual_score: float 0-1, description: str}. "
+                            "Sort by visual_score descending. "
+                            "Omit key entirely (or use []) if clip has only one good section."
+                        ),
                     },
                 }),
             }
@@ -315,6 +326,32 @@ def _describe_clip_visually(
         else:
             ts_start = ts_end = None
 
+        # Parse multi-segment annotations (only present for long clips)
+        parsed_segs = parsed.get("segments") or []
+        validated_segs = []
+        if isinstance(parsed_segs, list):
+            for seg in parsed_segs[:3]:   # cap at 3 segments per clip
+                if not isinstance(seg, dict):
+                    continue
+                try:
+                    s_start = float(seg["start_sec"])
+                    s_end   = float(seg["end_sec"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                s_start = max(0.0, min(clip_duration, s_start))
+                s_end   = max(0.0, min(clip_duration, s_end))
+                if s_end - s_start < 1.5:
+                    continue  # too short to be useful
+                validated_segs.append({
+                    "start_sec":       round(s_start, 3),
+                    "end_sec":         round(s_end,   3),
+                    "best_moment_sec": round((s_start + s_end) / 2, 3),
+                    "narrative_role":  str(seg.get("narrative_role", "development")),
+                    "emotion":         str(seg.get("emotion",        "neutral")),
+                    "visual_score":    max(0.0, min(1.0, float(seg.get("visual_score", 0.5)))),
+                    "description":     str(seg.get("description", "")),
+                })
+
         return {
             "description":    str(parsed.get("description", "")),
             "shot_type":      str(parsed.get("shot_type", "unknown")),
@@ -324,6 +361,7 @@ def _describe_clip_visually(
             "best_moment_sec": bm,
             "trim_start_sec":  ts_start,
             "trim_end_sec":    ts_end,
+            "segments":        validated_segs,
         }
     except Exception:
         return dict(_VISUAL_DEFAULT)

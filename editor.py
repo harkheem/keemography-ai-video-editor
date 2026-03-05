@@ -160,6 +160,223 @@ def detect_beats(audio_path: str) -> list[float]:
         return []
 
 
+# ── 4K proxy helpers ──────────────────────────────────────────────────────────
+
+def _probe_resolution(path: str) -> tuple:
+    """Returns (width, height) of the first video stream; (0, 0) on failure."""
+    if not path or not os.path.exists(path):
+        return (0, 0)
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "csv=s=x:p=0",
+        path,
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        parts = (res.stdout or "").strip().split("x")
+        if len(parts) == 2:
+            return (int(parts[0]), int(parts[1]))
+    except Exception:
+        pass
+    return (0, 0)
+
+
+def _is_4k(path: str) -> bool:
+    """True when clip resolution is 4K or higher (≥ 3840 wide or ≥ 2160 tall)."""
+    w, h = _probe_resolution(path)
+    return w >= 3840 or h >= 2160
+
+
+def _create_proxy(src_path: str, height: int = 1080) -> Optional[str]:
+    """
+    Downscale *src_path* to *height* lines for fast MoviePy processing.
+    Tries VideoToolbox (Apple GPU) first, falls back to libx264 ultrafast.
+    Returns a temp .mp4 path, or None on failure.
+    """
+    proxy = tempfile.NamedTemporaryFile(delete=False, suffix="_proxy.mp4")
+    proxy_path = proxy.name
+    proxy.close()
+
+    def _try(cmd):
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            return os.path.exists(proxy_path) and os.path.getsize(proxy_path) > 4096
+        except subprocess.CalledProcessError:
+            return False
+
+    scale_filter = f"scale=-2:{height}:flags=lanczos"
+
+    if _try(["ffmpeg", "-y", "-hwaccel", "videotoolbox", "-i", src_path,
+             "-vf", scale_filter, "-c:v", "h264_videotoolbox", "-b:v", "8M",
+             "-c:a", "aac", "-b:a", "192k", proxy_path]):
+        return proxy_path
+
+    if _try(["ffmpeg", "-y", "-i", src_path,
+             "-vf", scale_filter, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+             "-c:a", "aac", "-b:a", "192k", proxy_path]):
+        return proxy_path
+
+    try:
+        os.remove(proxy_path)
+    except Exception:
+        pass
+    return None
+
+
+def _ffmpeg_4k_render(
+    expanded_entries: list,   # list of (path, raw, meta) — path may be proxy
+    trim_log: dict,           # {expanded_index: (start_sec, end_sec)} on raw/proxy
+    transition_log: list,     # [{transition, duration, applied}] len = n_clips-1
+    proxy_to_orig: dict,      # proxy_path → original_4k_path
+    proxy_output_path: str,   # the proxy MP4 (its audio is muxed into 4K output)
+    target_fps: int,
+) -> str:
+    """
+    Re-render the final edit at the original 4K resolution using ffmpeg.
+
+    1. Each clip is trimmed to exactly the window chosen during proxy editing
+       (recorded in trim_log), but applied to the ORIGINAL 4K source file.
+    2. All segments are scaled to a uniform resolution (that of the first 4K clip).
+    3. xfade / concat transitions matching the proxy edit are applied.
+    4. The audio track from the proxy output (perfectly mixed by MoviePy) is muxed
+       in — so music, original-audio blending, etc. are all preserved.
+
+    Falls back: caller catches RuntimeError and serves the proxy output instead.
+    """
+    _XFADE_MAP = {
+        "crossfade":   "fade",
+        "fadein":      "fadeblack",
+        "fadeout":     "fadeblack",
+        "slide_left":  "slideleft",
+        "slide_right": "slideright",
+        "slide_up":    "slideup",
+        "slide_down":  "slidedown",
+        "zoom_in":     "zoomin",
+        "zoom_out":    "fadeblack",
+    }
+
+    n = len(expanded_entries)
+    if n == 0:
+        raise ValueError("No clips to render")
+
+    # ── Build (orig_path, start_sec, end_sec) per segment ────────────────────
+    segments = []
+    for i, (path, raw, _m) in enumerate(expanded_entries):
+        orig = proxy_to_orig.get(path, path)
+        d = float(getattr(raw, "duration", 0.0) or 0.0)
+        s, e = trim_log.get(i, (0.0, d))
+        s = max(0.0, float(s))
+        e = max(s + 0.1, float(e))
+        segments.append((orig, s, e))
+
+    # ── Determine output resolution ───────────────────────────────────────────
+    out_w, out_h = 0, 0
+    for orig, _s, _e in segments:
+        if orig in proxy_to_orig.values():
+            w, h = _probe_resolution(orig)
+            if w > 0 and h > 0:
+                out_w, out_h = w, h
+                break
+    if out_w == 0:
+        out_w, out_h = 3840, 2160
+
+    # ── ffmpeg inputs ─────────────────────────────────────────────────────────
+    cmd = ["ffmpeg", "-y", "-hwaccel", "videotoolbox"]
+    for orig, _s, _e in segments:
+        cmd += ["-i", orig]
+
+    # ── filter_complex: trim + normalize each clip ────────────────────────────
+    filter_parts = []
+    clip_durs = []
+    for i, (_orig, s, e) in enumerate(segments):
+        d = e - s
+        clip_durs.append(d)
+        filter_parts.append(
+            f"[{i}:v]trim=start={s:.4f}:end={e:.4f},"
+            f"setpts=PTS-STARTPTS,"
+            f"fps={target_fps},"
+            f"scale={out_w}:{out_h}:flags=lanczos,"
+            f"format=yuv420p[v{i}]"
+        )
+
+    fc = ";".join(filter_parts)
+
+    if n == 1:
+        fc += ";[v0]copy[vout]"
+    else:
+        prev_label = "v0"
+        cum_dur = clip_durs[0]
+        for i in range(1, n):
+            tlog = transition_log[i - 1] if i - 1 < len(transition_log) else {}
+            tdur = float(tlog.get("duration", 0.0))
+            ttype = tlog.get("transition", "crossfade")
+            applied = bool(tlog.get("applied", False))
+            xftype = _XFADE_MAP.get(ttype, "fade")
+            out_label = f"xv{i}"
+            if applied and tdur >= 0.1 and cum_dur > tdur + 0.05:
+                offset = max(0.0, cum_dur - tdur)
+                fc += (
+                    f";[{prev_label}][v{i}]xfade=transition={xftype}"
+                    f":duration={tdur:.4f}:offset={offset:.4f}[{out_label}]"
+                )
+                cum_dur += clip_durs[i] - tdur
+            else:
+                fc += f";[{prev_label}][v{i}]concat=n=2:v=1:a=0[{out_label}]"
+                cum_dur += clip_durs[i]
+            prev_label = out_label
+        fc += f";[{prev_label}]copy[vout]"
+
+    cmd += ["-filter_complex", fc, "-map", "[vout]"]
+
+    # ── Video-only pass (VideoToolbox → libx264 fallback) ─────────────────────
+    tmp_vid = tempfile.NamedTemporaryFile(delete=False, suffix="_4k_vid.mp4")
+    tmp_vid.close()
+
+    def _run_video_pass(extra_enc_args: list) -> subprocess.CompletedProcess:
+        full_cmd = cmd + ["-an"] + extra_enc_args + ["-fps_mode", "cfr", tmp_vid.name]
+        return subprocess.run(full_cmd, capture_output=True, text=True)
+
+    result = _run_video_pass(["-c:v", "h264_videotoolbox", "-b:v", "50M"])
+    if result.returncode != 0:
+        print(f"[4K] VideoToolbox failed (rc={result.returncode}), retrying with libx264…")
+        result = _run_video_pass(["-c:v", "libx264", "-preset", "slow", "-crf", "18"])
+    if result.returncode != 0:
+        try:
+            os.remove(tmp_vid.name)
+        except Exception:
+            pass
+        raise RuntimeError(f"4K video pass failed (both VideoToolbox and libx264):\n{(result.stderr or '')[-1200:]}")
+
+    # ── Mux 4K video + proxy audio track ─────────────────────────────────────
+    tmp_4k = tempfile.NamedTemporaryFile(delete=False, suffix="_4k_final.mp4")
+    tmp_4k.close()
+    mux = [
+        "ffmpeg", "-y",
+        "-i", tmp_vid.name,
+        "-i", proxy_output_path,
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "192k",
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-shortest",
+        tmp_4k.name,
+    ]
+    try:
+        r = subprocess.run(mux, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"Audio mux failed:\n{(r.stderr or '')[-600:]}")
+    finally:
+        try:
+            os.remove(tmp_vid.name)
+        except Exception:
+            pass
+
+    print(f"✅ 4K re-render complete → {out_w}×{out_h}  {tmp_4k.name}")
+    return tmp_4k.name
+
+
 def generate_video(
     clip_paths: List[str],
     storyline: str,
@@ -365,7 +582,7 @@ def generate_video(
         clip,
         idx: int,
         total: int,
-        role: str = "development",
+        alloc_sec: float,           # pre-computed weighted budget for this clip
         vision_trim_start: Optional[float] = None,
         vision_trim_end: Optional[float] = None,
         best_moment_sec: Optional[float] = None,
@@ -375,58 +592,35 @@ def generate_video(
         if duration <= 0.0:
             return clip
 
-        desired_total = float(target_duration_sec) if target_duration_sec else 34.0
-        base_target = desired_total / max(1, total)
-
-        # Narrative-role multipliers: hooks are punchy, payoffs breathe
-        role_mult = {
-            "hook":        0.65,
-            "turn":        0.80,
-            "development": 1.00,
-            "broll":       0.75,
-            "payoff":      1.25,
-        }.get((role or "development").lower(), 1.0)
-        target = max(1.8, base_target * role_mult)
-
-        # Tone multiplier: energetic = shorter clips overall, calm/sentimental = longer
-        target = max(1.8, target * _trim_mult)
-
-        if total > 1:
-            phase = idx / max(1, total - 1)
-            if phase < 0.2:
-                target *= 1.10
-            elif phase > 0.8:
-                target *= 1.05
-            else:
-                target *= 0.92
-            target = max(1.8, target)
-
-        target = min(duration, target)
-
-        # ── Story-relevance duration bonus ─────────────────────────────────
-        # Clips whose visual description overlaps with the user's storyline get
-        # up to 20 % more screen time so the story's key moments breathe more.
-        if story_weight > 0.15:
-            target = min(duration, target * (1.0 + 0.20 * story_weight))
+        # Clamp allocation to what the clip actually has
+        target = min(duration, max(1.5, float(alloc_sec)))
 
         if duration <= target + 0.35:
+            _trim_log[idx] = (0.0, duration)
             return clip
 
         # ── VISION-GUIDED TRIM (primary path) ─────────────────────────────
-        # GPT-4o has already identified the best moment and recommended a
-        # trim window. Use it directly when it covers at least half the
-        # target duration — it's a better signal than any heuristic.
+        # Clamp GPT-4o's trim recommendations to actual clip bounds BEFORE use.
+        # GPT-4o sometimes hallucinates timestamps beyond the real clip length.
         if vision_trim_start is not None and vision_trim_end is not None:
-            vts = max(0.0, float(vision_trim_start))
-            vte = min(duration, float(vision_trim_end))
+            vts = max(0.0, min(duration, float(vision_trim_start)))
+            vte = max(0.0, min(duration, float(vision_trim_end)))
             v_window = vte - vts
             if v_window >= target * 0.5:
-                # If the vision window is longer than target, centre on it
                 if v_window > target:
+                    # Window longer than budget — centre-crop to exactly target
                     center = (vts + vte) / 2.0
                     half   = target / 2.0
                     vts = max(0.0, center - half)
                     vte = min(duration, vts + target)
+                elif v_window < target - 0.05:
+                    # Window shorter than budget — expand around the window to
+                    # fill the full allocation without leaving the clip bounds
+                    extra = target - v_window
+                    vts = max(0.0, vts - extra / 2.0)
+                    vte = min(duration, vts + target)
+                    vts = max(0.0, vte - target)  # re-anchor if vte hit boundary
+                _trim_log[idx] = (vts, vte)
                 return apply_without_mask(apply_subclip(clip, vts, vte))
 
         # ── BEST-MOMENT ANCHOR (secondary path) ───────────────────────────
@@ -437,6 +631,7 @@ def generate_video(
             bm = max(0.0, min(duration - target, bm - target / 2.0))
             bm_end = min(duration, bm + target)
             if bm_end - bm >= target * 0.75:
+                _trim_log[idx] = (bm, bm_end)
                 return apply_without_mask(apply_subclip(clip, bm, bm_end))
 
         def _content_window_start() -> Optional[float]:
@@ -518,6 +713,7 @@ def generate_video(
             if smart_start is not None:
                 smart_end = min(duration, smart_start + target)
                 smart_clip = apply_subclip(clip, smart_start, smart_end)
+                _trim_log[idx] = (smart_start, smart_end)
                 return apply_without_mask(smart_clip)
         except Exception:
             pass
@@ -538,6 +734,7 @@ def generate_video(
 
         end_t = min(duration, start_t + target)
         trimmed = apply_subclip(clip, start_t, end_t)
+        _trim_log[idx] = (start_t, end_t)
         return apply_without_mask(trimmed)
 
     def load_clip(path):
@@ -555,32 +752,226 @@ def generate_video(
     # Normalize clip paths
     clip_paths = normalize_clip_paths(clip_paths)
 
+    # ── Proxy workflow for 4K sources ────────────────────────────────────────
+    # Any clip at 4K (≥ 3840 wide) is downscaled to a 1080p proxy so MoviePy
+    # works on ~4× less data per frame.  After the proxy edit, we replay the
+    # exact trim windows on the original 4K files in one fast ffmpeg pass.
+    _proxy_to_orig: dict = {}   # proxy_path → original_4k_path
+    _proxied_paths: list = []
+    for _p in clip_paths:
+        if _is_4k(_p):
+            _px = _create_proxy(_p)
+            if _px:
+                _proxy_to_orig[_px] = _p
+                _proxied_paths.append(_px)
+                temp_files.append(_px)   # cleaned up in finally
+                print(f"[PROXY] 4K→1080p proxy created for {os.path.basename(_p)}")
+            else:
+                print(f"[PROXY] Could not create proxy for {os.path.basename(_p)}, using original")
+                _proxied_paths.append(_p)
+        else:
+            _proxied_paths.append(_p)
+    clip_paths = _proxied_paths
+    has_4k = bool(_proxy_to_orig)
+
+    # Logs filled during editing — used by the 4K re-render pass
+    _trim_log: dict = {}       # expanded_index → (start_sec, end_sec) on proxy/raw
+    _transition_log: list = [] # one entry per consecutive clip pair
+
     # ── Load + trim one clip at a time ──────────────────────────────────────
     # Loading all clips in parallel peaks at (n_clips × clip_RAM). Instead we
     # load one, trim it immediately (so the full source is no longer needed),
     # close the original, and only keep the small trimmed version. Peak RAM
     # stays at ~1 clip rather than all clips simultaneously.
     _meta = clip_metadata or {}
+    # Mirror metadata from 4K originals to their proxies so scoring signals carry over
+    for _px_path, _orig_path in _proxy_to_orig.items():
+        if _orig_path in _meta:
+            _meta[_px_path] = _meta[_orig_path]
     clips: list = []
     load_failures: list = []
-    _deferred_close: list = []  # raw clips to close AFTER beat alignment
+    _deferred_close: list = []  # raw clips to close AFTER write_videofile
     n_paths = len(clip_paths)
-    for i, path in enumerate(clip_paths):
+
+    # ── Pre-load all raws ────────────────────────────────────────────────────
+    _raws: list = []
+    for path in clip_paths:
         raw = load_clip(path)
         if raw is None:
             load_failures.append(path)
-            continue
-        trimmed = apply_smart_trim(
-            raw, i, n_paths,
-            role             = _meta.get(path, {}).get("narrative_role", "development"),
-            vision_trim_start= _meta.get(path, {}).get("trim_start_sec"),
-            vision_trim_end  = _meta.get(path, {}).get("trim_end_sec"),
-            best_moment_sec  = _meta.get(path, {}).get("best_moment_sec"),
-            story_weight     = _story_weight(path),
+            _raws.append(None)
+        else:
+            _raws.append(raw)
+
+    # ── Weighted screen-time allocation ─────────────────────────────────────
+    # Each clip earns screen time in proportion to how much it deserves,
+    # based on GPT-4o metadata — not equal fair share.
+    #
+    # Weight dimensions:
+    #   narrative_role  — payoff clips get the most time, broll the least
+    #   visual_score    — higher quality = more time (scaled to avoid starving)
+    #   emotion         — emotionally heavy clips need longer to land
+    #   story_weight    — overlap with user storyline = extra budget
+    #   _trim_mult      — tone compression (energetic edits trim more overall)
+    _ROLE_WEIGHT = {
+        "hook":        1.20,   # sets the tone — short but visible
+        "payoff":      1.65,   # climax — deserves the most time
+        "turn":        1.15,   # story pivot
+        "development": 0.90,   # connective tissue
+        "broll":       0.55,   # pure context — keep short
+    }
+    _EMOTION_WEIGHT = {
+        "dramatic":  1.30,
+        "sad":       1.25,   # needs time to land emotionally
+        "inspiring": 1.20,
+        "exciting":  1.10,
+        "tense":     1.10,
+        "happy":     1.00,
+        "calm":      0.85,
+        "neutral":   0.80,
+    }
+
+    desired_total = float(target_duration_sec) if target_duration_sec else 34.0
+    _valid_pairs = [(p, r) for p, r in zip(clip_paths, _raws) if r is not None]
+
+    # ── Multi-segment expansion ──────────────────────────────────────────────
+    # If scoring identified 2-3 distinct good windows inside a single source
+    # clip, we create one independent timeline entry per segment.  Each entry
+    # carries its own trim window and narrative metadata so the allocation
+    # engine treats them as independent clips competing for screen time.
+    #
+    # The raw VideoFileClip object is intentionally shared across segments from
+    # the same source — MoviePy's lazy pipeline means we don't read the file
+    # twice.  _deferred_close deduplicates by id() to avoid double-closing.
+    _expanded: list = []   # (path, raw, per_segment_meta_dict)
+    for path, raw in _valid_pairs:
+        base_m = _meta.get(path, {})
+        segments = base_m.get("segments") or []
+        if len(segments) >= 2:
+            print(f"[SEGMENTS] {os.path.basename(path)} → {len(segments)} windows")
+            for seg in segments:
+                s_start = seg.get("start_sec")
+                s_end   = seg.get("end_sec")
+                if s_start is None or s_end is None:
+                    continue
+                seg_meta = {
+                    **base_m,
+                    "trim_start_sec":  float(s_start),
+                    "trim_end_sec":    float(s_end),
+                    "best_moment_sec": seg.get("best_moment_sec", (float(s_start) + float(s_end)) / 2),
+                    "narrative_role":  seg.get("narrative_role", base_m.get("narrative_role", "development")),
+                    "emotion":         seg.get("emotion",        base_m.get("emotion",        "neutral")),
+                    "visual_score":    float(seg.get("visual_score", base_m.get("visual_score", 0.5))),
+                    "description":     seg.get("description",    base_m.get("description",    "")),
+                    "segments":        [],  # don't recurse
+                }
+                _expanded.append((path, raw, seg_meta))
+        else:
+            _expanded.append((path, raw, base_m))
+
+    if not _expanded:
+        _expanded = [(p, r, _meta.get(p, {})) for p, r in _valid_pairs]
+    # ────────────────────────────────────────────────────────────────────────
+
+    # Raw unnormalized weight per segment entry
+    _raw_weights: list[float] = []
+    for path, raw, m in _expanded:
+        role = (m.get("narrative_role") or "development").lower()
+        emo  = (m.get("emotion")        or "neutral").lower()
+        vs   = float(m.get("visual_score") or 0.5)
+        sw   = _story_weight(path)
+
+        w = (
+            _ROLE_WEIGHT.get(role, 0.90)
+            * (0.35 + 0.65 * max(0.0, min(1.0, vs)))  # quality, not starving low scores
+            * _EMOTION_WEIGHT.get(emo, 0.90)
+            * (1.0 + 0.25 * sw)                        # story overlap bonus
+            * _trim_mult                                # tone-level compression
         )
-        # Defer closing raw — subclips still hold a reference to raw's reader.
-        # Closing raw now would NoneType the reader before beat alignment runs.
-        if trimmed is not raw:
+        _raw_weights.append(max(0.01, w))
+
+    # Normalise weights (for iterative saturation below)
+    _total_w = sum(_raw_weights) or 1.0
+
+    # Per-clip available window
+    # Always use the FULL raw clip duration as the ceiling — GPT-4o's narrow
+    # trim windows are HINTS for WHERE to cut, not hard limits on how much footage
+    # is available. Using window sizes as ceilings caused short outputs when GPT-4o
+    # hallucinated timestamps beyond the actual clip length.
+    def _entry_avail(raw_clip, m: dict) -> float:
+        return float(getattr(raw_clip, "duration", 0.0) or 0.0)
+
+    _clip_durs = [_entry_avail(r, m) for _, r, m in _expanded]
+    _N = len(_expanded)
+    FLOOR = 1.5
+    # CEIL_RATIO must be >= 1/N so that N clips can collectively fill 100% of the
+    # budget. With 2 clips, 0.45*2=0.90 — always 10% short. Use max(0.45, 1/N).
+    CEIL_RATIO = max(0.45, 1.0 / max(1, _N))
+
+    # Per-clip hard ceiling: actual available footage OR the ratio cap, whichever
+    # is smaller. Ensures we never ask a clip for more than it has.
+    _ceilings = [max(FLOOR, min(_clip_durs[i], desired_total * CEIL_RATIO))
+                 for i in range(_N)]
+
+    # ── Iterative saturation allocation ─────────────────────────────────────
+    # Single-pass normalization is broken: rescaling after clamping pushes
+    # ceiling-capped clips above their ceiling, then apply_smart_trim silently
+    # clips them back, leaking budget. Instead we iterate:
+    #   1. Distribute budget proportionally to unsaturated clips.
+    #   2. Any clip whose tentative alloc >= ceiling is pinned to that ceiling.
+    #   3. Its budget surplus is freed for the remaining unsaturated clips.
+    #   4. Repeat until no new pins → assign remainder proportionally.
+    _alloc_final = [0.0] * _N
+    _saturated   = [False] * _N
+    _rem_budget  = desired_total
+
+    for _iter in range(_N + 2):
+        _free_w = sum(_raw_weights[i] for i in range(_N) if not _saturated[i]) or 1e-9
+        _any_new = False
+        for i in range(_N):
+            if not _saturated[i]:
+                _tentative = _rem_budget * _raw_weights[i] / _free_w
+                if _tentative >= _ceilings[i] - 0.01:
+                    _alloc_final[i] = _ceilings[i]
+                    _saturated[i]   = True
+                    _rem_budget    -= _ceilings[i]
+                    _any_new        = True
+        if not _any_new:
+            # No further saturation — assign remaining budget proportionally
+            _free_w = sum(_raw_weights[i] for i in range(_N) if not _saturated[i]) or 1e-9
+            for i in range(_N):
+                if not _saturated[i]:
+                    _alloc_final[i] = max(FLOOR, _rem_budget * _raw_weights[i] / _free_w)
+            break
+
+    # Log allocation table
+    print(f"[ALLOC] target={desired_total:.0f}s  entries={len(_expanded)}")
+    for (path, _, m), alloc, avail in zip(_expanded, _alloc_final, _clip_durs):
+        seg_tag = f"[{m.get('trim_start_sec', '?'):.0f}-{m.get('trim_end_sec', '?'):.0f}s]" \
+            if m.get("trim_start_sec") is not None else ""
+        print(f"  {os.path.basename(path):<28}{seg_tag:<12}  "
+              f"role={m.get('narrative_role','?'):<11}  "
+              f"emotion={m.get('emotion','?'):<10}  vs={float(m.get('visual_score',0.5)):.2f}  "
+              f"alloc={alloc:.1f}s / {avail:.1f}s")
+    # ────────────────────────────────────────────────────────────────────────
+
+    _closed_raw_ids: set = set()  # avoid double-closing shared raws
+    alloc_iter = iter(_alloc_final)
+    for i, (path, raw, m) in enumerate(_expanded):
+        alloc = next(alloc_iter)
+        trimmed = apply_smart_trim(
+            raw, i, len(_expanded),
+            alloc_sec         = alloc,
+            vision_trim_start = m.get("trim_start_sec"),
+            vision_trim_end   = m.get("trim_end_sec"),
+            best_moment_sec   = m.get("best_moment_sec"),
+            story_weight      = _story_weight(path),
+        )
+        # Defer closing raw — the entire lazy MoviePy pipeline chains back to
+        # raw's reader through write_videofile. Closed in the finally block.
+        # Use id() dedup so shared raws (multi-segment clips) are only closed once.
+        if trimmed is not raw and id(raw) not in _closed_raw_ids:
+            _closed_raw_ids.add(id(raw))
             _deferred_close.append(raw)
         clips.append(trimmed)
         gc.collect()  # release frame buffers before loading the next clip
@@ -664,6 +1055,10 @@ def generate_video(
                 beat_len = end - start
                 if beat_len > 0 and c.duration > beat_len:
                     clips[i] = apply_subclip(c, 0, beat_len)
+                    # Update trim log: keep the chosen start, shorten the window
+                    if i in _trim_log:
+                        _s0, _ = _trim_log[i]
+                        _trim_log[i] = (_s0, _s0 + beat_len)
 
     # Safe to close raw clips now — beat alignment (the last reader-dependent
     # operation on trimmed subclips) is complete.
@@ -685,7 +1080,7 @@ def generate_video(
             try:
                 transitioned = apply_transition(prev, nxt, transition, tdur)
                 final_clips[-1] = apply_without_mask(apply_end(transitioned, transitioned.duration))
-
+                _transition_log.append({"transition": transition, "duration": tdur, "applied": True})
                 fade_next = min(tdur, 0.25 * nxt.duration)
                 fade_next = fade_next if fade_next >= 0.12 else 0.0
                 final_clips.append(apply_without_mask(apply_fadein(nxt, fade_next)))
@@ -694,6 +1089,7 @@ def generate_video(
                 print(f"⚠️ Transition failed ({transition}) at clip {i}: {repr(e)}")
 
         # fallback: no transition (or tiny fade)
+        _transition_log.append({"transition": "crossfade", "duration": 0.0, "applied": False})
         fade_next = min(0.12, 0.15 * nxt.duration)
         fade_next = fade_next if fade_next >= 0.08 else 0.0
         final_clips.append(apply_without_mask(apply_fadein(nxt, fade_next)))
@@ -772,8 +1168,12 @@ def generate_video(
                 bg_music_clip = concatenate_audioclips([bg_music_clip] * max(1, loops))
             bg_music_clip = apply_audio_subclip(bg_music_clip, 0, min(bg_music_clip.duration, final.duration))
         except Exception as e:
-            print(f"⚠️ Could not load background music: {repr(e)}")
+            print(f"⚠️ Could not load background music from {music_path}: {repr(e)}")
+            print("   → Add MP3 files to assets/music/ (see assets/music/README.md)")
             bg_music_clip = None
+    elif music_path:
+        print(f"⚠️ Background music file not found: {music_path}")
+        print("   → Add MP3 files to assets/music/ (see assets/music/README.md)")
 
     # Audio mixing
     try:
@@ -848,6 +1248,81 @@ def generate_video(
                 os.remove(f)
             except Exception:
                 pass
+
+    # ── Hard duration guarantee ───────────────────────────────────────────────
+    # After MoviePy writes the proxy, verify the actual output duration with
+    # ffprobe. If it is shorter than 90% of target (e.g. because GPT-4o trim
+    # windows were narrower than the allocated budget), pad with a freeze of the
+    # last frame so the video is ALWAYS the requested length.
+    if target_duration_sec:
+        try:
+            _probe_cmd = [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                temp_out.name,
+            ]
+            _probe_res = subprocess.run(_probe_cmd, capture_output=True, text=True)
+            _actual_dur = float((_probe_res.stdout or "0").strip() or "0")
+            _target_dur = float(target_duration_sec)
+            print(f"[DUR] proxy={_actual_dur:.2f}s  target={_target_dur:.2f}s")
+            if _actual_dur < _target_dur * 0.99:
+                _pad_needed = _target_dur - _actual_dur
+                print(f"[DUR] Output is {_actual_dur:.1f}s — padding {_pad_needed:.1f}s to reach {_target_dur:.0f}s")
+                _padded = tempfile.NamedTemporaryFile(delete=False, suffix="_padded.mp4")
+                _padded.close()
+                _pad_cmd = [
+                    "ffmpeg", "-y",
+                    "-i", temp_out.name,
+                    "-vf", f"tpad=stop_mode=clone:stop_duration={_pad_needed:.4f}",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                    "-c:a", "aac",
+                    "-t", str(_target_dur),
+                    _padded.name,
+                ]
+                _pad_result = subprocess.run(_pad_cmd, capture_output=True, text=True)
+                if _pad_result.returncode == 0 and os.path.getsize(_padded.name) > 4096:
+                    os.remove(temp_out.name)
+                    # Replace temp_out reference by reassigning via a wrapper object
+                    class _NamedRef:
+                        def __init__(self, name): self.name = name
+                    temp_out = _NamedRef(_padded.name)
+                    print(f"[DUR] Padded proxy → {_target_dur:.0f}s")
+                else:
+                    try:
+                        os.remove(_padded.name)
+                    except Exception:
+                        pass
+                    print(f"[DUR] Padding failed (rc={_pad_result.returncode}), keeping short output")
+        except Exception as _dur_err:
+            print(f"[DUR] Duration check skipped: {_dur_err}")
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+
+    # ── 4K re-render: replay trim windows on original 4K sources ─────────────
+    # All MoviePy work was done on 1080p proxies (fast, low-RAM).
+    # Now we hand the exact trim windows + transition sequence to ffmpeg, which
+    # decodes the ORIGINAL 4K files and produces a native-res output.
+    # The proxy MP4 is kept alive as an audio reference (it has the mixed
+    # music/original-audio track), then deleted after the mux.
+    if has_4k:
+        print(f"[4K] Re-rendering {len(_expanded)} segments at original resolution…")
+        k4_path = _ffmpeg_4k_render(
+            expanded_entries  = _expanded,
+            trim_log          = _trim_log,
+            transition_log    = _transition_log,
+            proxy_to_orig     = _proxy_to_orig,
+            proxy_output_path = temp_out.name,
+            target_fps        = _fps,
+        )
+        # 4K re-render succeeded — proxy output is no longer needed
+        try:
+            os.remove(temp_out.name)
+        except Exception:
+            pass
+        return k4_path
 
     return temp_out.name
 

@@ -1,0 +1,47 @@
+# ── Python virtualenvs ────────────────────────────────────────────────────────
+venv/
+venv*/
+.venv/
+.venv*/
+
+# ── Byte-compiled / cache ─────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ── Temp video scratch files produced by MoviePy ─────────────────────────────
+tmp*.mp4
+tmp*.wav
+tmp*.mov
+*TEMP_MPY*
+
+# ── Git history ───────────────────────────────────────────────────────────────
+.git/
+.github/
+
+# ── Node artifacts (re-installed inside the image) ───────────────────────────
+frontend/node_modules/
+frontend/dist/
+
+# ── Streamlit / legacy ────────────────────────────────────────────────────────
+.streamlit/
+
+# ── Local secrets / state ────────────────────────────────────────────────────
+.env
+session_data.json
+
+# ── macOS / editor ────────────────────────────────────────────────────────────
+.DS_Store
+.devcontainer/
+
+# ── Raw media (uploaded by users at runtime, not baked into image) ────────────
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.wav
+*.mp3
+*.aac
+*.flac

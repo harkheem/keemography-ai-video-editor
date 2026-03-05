@@ -1,4 +1,10 @@
-streamlit==1.45.1
+# Web framework
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+python-multipart>=0.0.9
+
+# Legacy streamlit (kept for reference, not used in production)
+# streamlit==1.45.1
 python-dotenv==1.0.1
 openai==1.51.0
 moviepy==2.1.1
