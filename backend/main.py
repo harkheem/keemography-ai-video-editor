@@ -282,7 +282,7 @@ def _run_job(job_id: str, params: dict) -> None:
         _emit(job_id, 5, "Validating clips…")
         good, bad = filter_existing(clip_paths)
         if bad:
-            print(f"[JOB {job_id}] Skipping {len(bad)} invalid path(s): {bad[:5]}")
+            logging.warning("[JOB %s] Skipping %d invalid path(s): %s", job_id, len(bad), bad[:5])
         if not good:
             raise ValueError("No usable clips found after validation.")
 
@@ -377,10 +377,28 @@ def _run_job(job_id: str, params: dict) -> None:
                 for p in relevant_paths
             ]
 
+    except BrokenPipeError:
+        # Railway's log aggregator closed stdout mid-job.
+        # Check if the render file was actually created before the pipe broke.
+        if 'final_path' in locals() and final_path and os.path.exists(final_path):
+            filename = f"keemography_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+            with _jobs_lock:
+                _jobs[job_id]["status"] = "done"
+                _jobs[job_id]["result_path"] = final_path
+                _jobs[job_id]["filename"] = filename
+                _jobs[job_id]["events"].append(json.dumps({"done": True, "status": "done"}))
+        else:
+            with _jobs_lock:
+                _jobs[job_id]["status"] = "error"
+                _jobs[job_id]["error"] = "Rendering failed — please try again"
+                _jobs[job_id]["events"].append(
+                    json.dumps({"progress": -1, "message": "Error: rendering failed, please try again"})
+                )
+
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
-        print(f"[JOB {job_id}] ERROR:\n{tb}")
+        logging.error("[JOB %s] ERROR:\n%s", job_id, tb)
         with _jobs_lock:
             _jobs[job_id]["status"] = "error"
             _jobs[job_id]["error"] = str(e)
