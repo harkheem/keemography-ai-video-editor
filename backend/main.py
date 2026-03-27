@@ -463,6 +463,7 @@ async def job_events(job_id: str):
     async def _generate():
         import asyncio
         last_idx = 0
+        last_ping = 0.0
         try:
             while True:
                 with _jobs_lock:
@@ -476,14 +477,20 @@ async def job_events(job_id: str):
                     for ev in events[last_idx:]:
                         yield f"data: {ev}\n\n"
                     last_idx = len(events)
+                    last_ping = asyncio.get_event_loop().time()
 
                 if job["status"] in ("done", "error"):
                     yield f"data: {json.dumps({'done': True, 'status': job['status'], 'error': job.get('error')})}\n\n"
                     break
 
+                # Send a keepalive comment every 15 s so proxies don't drop the connection
+                now = asyncio.get_event_loop().time()
+                if now - last_ping >= 15:
+                    yield ": keepalive\n\n"
+                    last_ping = now
+
                 await asyncio.sleep(0.4)
         except (BrokenPipeError, GeneratorExit, ConnectionResetError):
-            # Client disconnected — job keeps running in background thread
             pass
 
     return StreamingResponse(
