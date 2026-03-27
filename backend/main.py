@@ -292,7 +292,13 @@ def _run_job(job_id: str, params: dict) -> None:
             raise ValueError("Transcription failed for all clips.")
 
         # ── Score / visual analysis ───────────────────────────────────────
-        _emit(job_id, 47, "Scoring clips with GPT-4o vision…")
+        n_clips = len(transcriptions)
+        _emit(job_id, 47, f"Analyzing {n_clips} clip(s) with AI vision…")
+
+        def _vision_progress(done: int, total: int, clip_name: str) -> None:
+            pct = 47 + int(19 * done / max(1, total))  # 47% → 66%
+            _emit(job_id, pct, f"Analyzing clip {done}/{total}: {clip_name}")
+
         scored = score_clips_with_story(
             transcriptions,
             storyline,
@@ -301,6 +307,7 @@ def _run_job(job_id: str, params: dict) -> None:
             tone=tone,
             target_duration_sec=target_duration_sec,
             openai_api_key=api_key,
+            progress_callback=_vision_progress,
         )
         gc.collect()
 

@@ -196,6 +196,191 @@ _VISUAL_DEFAULT: Dict = {
 }
 
 
+def _audio_energy_profile(video_path: str) -> Optional[Dict]:
+    """
+    Extract audio energy profile from a clip using librosa.
+    Returns a dict with peak_energy_sec, avg_energy, and a label (high/medium/low).
+    Used to pass audio context to vision models alongside frames.
+    """
+    try:
+        import subprocess
+        import tempfile
+        import librosa  # type: ignore
+
+        # Extract mono audio to a temp wav
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_wav = tmp.name
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", video_path, "-vn", "-ac", "1", "-ar", "22050",
+             "-c:a", "pcm_s16le", tmp_wav],
+            capture_output=True, check=True,
+        )
+        y, sr = librosa.load(tmp_wav, sr=22050, mono=True)
+        try:
+            os.remove(tmp_wav)
+        except Exception:
+            pass
+
+        rms = librosa.feature.rms(y=y)[0]
+        times = librosa.frames_to_time(range(len(rms)), sr=sr)
+        avg_energy = float(np.mean(rms))
+        peak_idx = int(np.argmax(rms))
+        peak_sec = float(times[peak_idx])
+
+        if avg_energy > 0.05:
+            label = "high"
+        elif avg_energy > 0.015:
+            label = "medium"
+        else:
+            label = "low"
+
+        return {
+            "peak_energy_sec": round(peak_sec, 2),
+            "avg_energy": round(avg_energy, 4),
+            "energy_label": label,
+        }
+    except Exception:
+        return None
+
+
+def _describe_clip_visually_gemini(
+    video_path: str,
+    clip_duration: float,
+    google_api_key: str,
+    story: str,
+    tone: str,
+    story_beats: Optional[List[str]] = None,
+    audio_profile: Optional[Dict] = None,
+) -> Dict:
+    """
+    Analyze a video clip using Gemini 2.0 Flash with native video input.
+    Gemini receives the actual video file (not just frames), so it sees
+    motion, timing, pacing, and audio tone — not just static snapshots.
+    """
+    try:
+        import google.generativeai as genai  # type: ignore
+        genai.configure(api_key=google_api_key)
+
+        model = genai.GenerativeModel("gemini-2.0-flash")
+
+        # Upload video to Gemini Files API
+        video_file = genai.upload_file(video_path)
+
+        # Wait for processing
+        import time
+        while video_file.state.name == "PROCESSING":
+            time.sleep(1)
+            video_file = genai.get_file(video_file.name)
+
+        if video_file.state.name != "ACTIVE":
+            return dict(_VISUAL_DEFAULT)
+
+        beats_text = ", ".join(story_beats[:4]) if story_beats else "hook, development, payoff"
+        audio_hint = ""
+        if audio_profile:
+            audio_hint = (
+                f"Audio analysis: energy={audio_profile['energy_label']}, "
+                f"peak at {audio_profile['peak_energy_sec']}s. "
+                "Use peak_energy_sec as a strong signal for best_moment_sec when relevant.\n"
+            )
+        prompt = (
+            f"You are a professional cinematographer analyzing a {round(clip_duration, 1)}s raw video clip for a short-form edit.\n"
+            f"Story context: {(story or '')[:300]}\n"
+            f"Narrative beats to serve: {beats_text}\n"
+            f"Edit tone: {tone or 'cinematic'}\n"
+            f"{audio_hint}\n"
+            "Analyze the full video including motion, pacing, audio tone, and visual quality.\n"
+            "Return ONLY strict JSON with these exact fields:\n"
+            '{"description": "1-2 sentence visual summary", '
+            '"shot_type": "close_up|medium|wide|extreme_wide|action|talking_head|product|landscape|broll", '
+            '"emotion": "exciting|calm|tense|happy|sad|inspiring|neutral|dramatic", '
+            '"visual_quality": 0.0-1.0, '
+            '"story_relevance": 0.0-1.0, '
+            '"narrative_role": "hook|development|turn|payoff|broll", '
+            '"best_moment_sec": float_timestamp_of_peak_moment, '
+            '"trim_start_sec": float_recommended_start, '
+            '"trim_end_sec": float_recommended_end, '
+            '"segments": []}'
+        )
+
+        response = model.generate_content([video_file, prompt])
+
+        # Clean up the uploaded file to avoid storage buildup
+        try:
+            genai.delete_file(video_file.name)
+        except Exception:
+            pass
+
+        raw = (response.text or "").strip()
+        raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("`").strip()
+        parsed = json.loads(raw)
+
+        vq = max(0.0, min(1.0, float(parsed.get("visual_quality", 0.5))))
+        sr = max(0.0, min(1.0, float(parsed.get("story_relevance", 0.5))))
+
+        def _safe_float(key: str) -> Optional[float]:
+            v = parsed.get(key)
+            if v is None:
+                return None
+            try:
+                return float(v)
+            except Exception:
+                return None
+
+        bm = _safe_float("best_moment_sec")
+        ts_start = _safe_float("trim_start_sec")
+        ts_end = _safe_float("trim_end_sec")
+
+        if bm is not None:
+            bm = max(0.0, min(clip_duration, bm))
+        if ts_start is not None and ts_end is not None:
+            ts_start = max(0.0, ts_start)
+            ts_end = min(clip_duration, ts_end)
+            if ts_end - ts_start < 1.0:
+                ts_start = ts_end = None
+        else:
+            ts_start = ts_end = None
+
+        parsed_segs = parsed.get("segments") or []
+        validated_segs = []
+        if isinstance(parsed_segs, list):
+            for seg in parsed_segs[:3]:
+                if not isinstance(seg, dict):
+                    continue
+                try:
+                    s_start = float(seg["start_sec"])
+                    s_end = float(seg["end_sec"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                s_start = max(0.0, min(clip_duration, s_start))
+                s_end = max(0.0, min(clip_duration, s_end))
+                if s_end - s_start < 1.5:
+                    continue
+                validated_segs.append({
+                    "start_sec": round(s_start, 3),
+                    "end_sec": round(s_end, 3),
+                    "best_moment_sec": round((s_start + s_end) / 2, 3),
+                    "narrative_role": str(seg.get("narrative_role", "development")),
+                    "emotion": str(seg.get("emotion", "neutral")),
+                    "visual_score": max(0.0, min(1.0, float(seg.get("visual_score", 0.5)))),
+                    "description": str(seg.get("description", "")),
+                })
+
+        return {
+            "description": str(parsed.get("description", "")),
+            "shot_type": str(parsed.get("shot_type", "unknown")),
+            "emotion": str(parsed.get("emotion", "neutral")),
+            "visual_score": round(0.40 * vq + 0.60 * sr, 4),
+            "narrative_role": str(parsed.get("narrative_role", "development")),
+            "best_moment_sec": bm,
+            "trim_start_sec": ts_start,
+            "trim_end_sec": ts_end,
+            "segments": validated_segs,
+        }
+    except Exception:
+        return dict(_VISUAL_DEFAULT)
+
+
 def _describe_clip_visually(
     frames_with_ts: List[Tuple[str, float]],   # (base64, timestamp_sec)
     clip_duration: float,
@@ -203,6 +388,7 @@ def _describe_clip_visually(
     story: str,
     tone: str,
     story_beats: Optional[List[str]] = None,
+    audio_profile: Optional[Dict] = None,
 ) -> Dict:
     """
     Send timestamped frames to GPT-4o vision.
@@ -235,6 +421,7 @@ def _describe_clip_visually(
                     "story_context": (story or "")[:300],
                     "story_beats": (story_beats or [])[:4],
                     "tone": tone or "cinematic",
+                    "audio_profile": audio_profile or {},
                     "return_fields": {
                         "description": "1-2 sentence visual description of what is happening",
                         "shot_type": "one of: close_up | medium | wide | extreme_wide | action | talking_head | product | landscape | broll",
@@ -270,7 +457,7 @@ def _describe_clip_visually(
                 }),
             }
         ]
-        for b64, _ts in frames_with_ts[:5]:
+        for b64, _ in frames_with_ts[:5]:
             content.append({
                 "type": "image_url",
                 "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "low"},
@@ -290,8 +477,9 @@ def _describe_clip_visually(
                 },
                 {"role": "user", "content": content},
             ],
-            max_tokens=280,
+            max_tokens=500,
             temperature=0.0,
+            response_format={"type": "json_object"},
         )
         raw = (response.choices[0].message.content or "").strip()
         raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("`").strip()
@@ -374,13 +562,17 @@ def _score_clips_visually(
     api_key: Optional[str],
     max_workers: int = 2,  # 2 instead of 4 — each worker holds frame data in RAM
     story_beats: Optional[List[str]] = None,
+    progress_callback: Optional[callable] = None,  # (done: int, total: int, clip_name: str)
 ) -> Dict[str, Dict]:
     """
-    Run GPT-4o visual analysis concurrently for all clips.
+    Run visual analysis concurrently for all clips.
+    Uses Gemini 2.0 Flash (native video) when GOOGLE_API_KEY is set,
+    otherwise falls back to GPT-4o frame analysis.
     Returns a dict keyed by clip path.
-    Now passes story_beats so GPT-4o can align trim recommendations
-    to specific narrative moments.
+    Calls progress_callback(done, total, clip_name) after each clip finishes.
     """
+    google_api_key = os.getenv("GOOGLE_API_KEY")
+
     def _probe_duration(path: str) -> float:
         import subprocess
         try:
@@ -398,18 +590,50 @@ def _score_clips_visually(
         if not path or not os.path.exists(path):
             return path, dict(_VISUAL_DEFAULT)
         clip_dur = _probe_duration(path)
-        frames_with_ts = _sample_frames_ffmpeg(path, max_frames=6)
+        audio_profile = _audio_energy_profile(path)
+
+        # Prefer Gemini native video analysis (sees motion + audio, not just frames)
+        if google_api_key:
+            result = _describe_clip_visually_gemini(
+                path, clip_dur, google_api_key, story, tone,
+                story_beats=story_beats,
+                audio_profile=audio_profile,
+            )
+            # Only fall back to GPT-4o if Gemini returned the default (failed)
+            if result != _VISUAL_DEFAULT:
+                return path, result
+
+        # GPT-4o frame fallback: more frames for longer clips
+        adaptive_frames = 10 if clip_dur > 15 else 6
+        frames_with_ts = _sample_frames_ffmpeg(path, max_frames=adaptive_frames)
         result = _describe_clip_visually(
             frames_with_ts, clip_dur, api_key or "", story, tone,
             story_beats=story_beats,
+            audio_profile=audio_profile,
         )
         return path, result
 
     results: Dict[str, Dict] = {}
+    total = len(transcriptions)
+    done = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        for path, meta in ex.map(_analyse, transcriptions):
+        futures = {ex.submit(_analyse, t): t for t in transcriptions}
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                path, meta = fut.result()
+            except Exception:
+                t = futures[fut]
+                path = t.get("path", "")
+                meta = dict(_VISUAL_DEFAULT)
             if path:
                 results[path] = meta
+            done += 1
+            if callable(progress_callback):
+                clip_name = os.path.basename(path) if path else f"clip {done}"
+                try:
+                    progress_callback(done, total, clip_name)
+                except Exception:
+                    pass
     return results
 
 
@@ -645,6 +869,7 @@ def _llm_editorial_rerank(
                 },
             ],
             max_tokens=220,
+            response_format={"type": "json_object"},
         )
 
         content = (response.choices[0].message.content or "").strip()
@@ -689,13 +914,14 @@ def _llm_story_plan(story: str, api_key: Optional[str], tone: Optional[str] = No
             "format": {"beats": ["hook", "development", "turn", "payoff"]},
         }
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             temperature=0.1,
             messages=[
                 {"role": "system", "content": "You are a senior narrative video editor. Output strict JSON only."},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
-            max_tokens=180,
+            max_tokens=300,
+            response_format={"type": "json_object"},
         )
         content = (response.choices[0].message.content or "").strip()
         parsed = json.loads(content)
@@ -707,6 +933,86 @@ def _llm_story_plan(story: str, api_key: Optional[str], tone: Optional[str] = No
     except Exception:
         return None
 
+
+def _llm_continuity_check(
+    ordered: List[Dict],
+    story: str,
+    api_key: Optional[str],
+    tone: Optional[str] = None,
+) -> List[Dict]:
+    """
+    Second-pass LLM review: given the selected sequence, ask GPT-4o to flag
+    any transitions that feel jarring and suggest a swap (from the same list).
+    Returns the (potentially reordered) list. Falls back to input unchanged on error.
+    """
+    if not api_key or len(ordered) < 2:
+        return ordered
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+
+        clips_summary = [
+            {
+                "idx": i,
+                "shot_type": c.get("shot_type", "unknown"),
+                "emotion": c.get("emotion", "neutral"),
+                "narrative_role": c.get("narrative_role", "development"),
+                "description": (c.get("description", "") or "")[:120],
+            }
+            for i, c in enumerate(ordered)
+        ]
+
+        prompt = {
+            "task": (
+                "Review this planned clip sequence for a short-form video edit. "
+                "Identify any transitions between consecutive clips that feel jarring "
+                "(mismatched emotion, abrupt shot-size jump, broken narrative flow). "
+                "If a swap within the existing list would improve flow, return a new order. "
+                "Otherwise return the same order. "
+                "Return ONLY JSON: {\"order\": [list of idx values]}"
+            ),
+            "story": (story or "")[:300],
+            "tone": tone or "cinematic",
+            "sequence": clips_summary,
+        }
+
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            temperature=0.0,
+            messages=[
+                {"role": "system", "content": "You are a professional video editor reviewing a cut sequence. Output strict JSON only."},
+                {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+            ],
+            max_tokens=200,
+            response_format={"type": "json_object"},
+        )
+
+        parsed = json.loads(response.choices[0].message.content or "{}")
+        raw_order = parsed.get("order", []) if isinstance(parsed, dict) else []
+
+        seen: set = set()
+        new_order: List[int] = []
+        for item in raw_order:
+            try:
+                idx = int(item)
+            except Exception:
+                continue
+            if 0 <= idx < len(ordered) and idx not in seen:
+                seen.add(idx)
+                new_order.append(idx)
+
+        # Append any clips the LLM omitted (don't lose clips)
+        for i in range(len(ordered)):
+            if i not in seen:
+                new_order.append(i)
+
+        if new_order:
+            return [ordered[i] for i in new_order]
+        return ordered
+    except Exception:
+        return ordered
+
+
 def score_clips_with_story(
     transcriptions: List[Dict[str, str]],
     story: str,
@@ -715,6 +1021,7 @@ def score_clips_with_story(
     tone: Optional[str] = None,
     target_duration_sec: Optional[int] = None,
     openai_api_key: Optional[str] = None,
+    progress_callback: Optional[callable] = None,  # (done, total, clip_name)
 ) -> List[Dict]:
     """
     Returns clips ranked by hybrid visual + semantic + lexical relevance,
@@ -743,6 +1050,7 @@ def score_clips_with_story(
     visual_meta: Dict[str, Dict] = _score_clips_visually(
         transcriptions, story_text, tone or "", api_key,
         story_beats=story_segments,
+        progress_callback=progress_callback,
     )
     story_keywords = _auto_keywords(story_text)
 
@@ -913,6 +1221,8 @@ def score_clips_with_story(
             if t.get("path")
         ]
         result = _fix_shot_continuity(result, full_pool, max_fixes=4)
+        # Second-pass LLM review: verify transitions feel natural, swap if needed
+        result = _llm_continuity_check(result, story_text, api_key, tone)
         return result
     # Final fallback: original order with default metadata
     return [

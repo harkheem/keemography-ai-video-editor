@@ -152,15 +152,22 @@ export async function pollStatus(jobId) {
 // ---------------------------------------------------------------------------
 export function streamEvents(jobId, onEvent, onDone, onError) {
   const es = new EventSource(`${BASE}/events/${jobId}`)
+  let closed = false
+
+  const close = () => {
+    closed = true
+    es.close()
+  }
+
   es.onmessage = (e) => {
     try {
       const data = JSON.parse(e.data)
       if (data.done) {
+        close()
         onDone(data)
-        es.close()
       } else if (data.error && !data.progress) {
+        close()
         onError(new Error(data.error))
-        es.close()
       } else {
         onEvent(data)
       }
@@ -169,10 +176,11 @@ export function streamEvents(jobId, onEvent, onDone, onError) {
     }
   }
   es.onerror = () => {
-    onError(new Error('SSE connection lost'))
-    es.close()
+    if (closed) return  // server closed stream after done — not a real error
+    close()
+    onError(new Error('Cannot reach backend server. Make sure it is running.'))
   }
-  return () => es.close() // return cleanup fn
+  return close
 }
 
 // ---------------------------------------------------------------------------

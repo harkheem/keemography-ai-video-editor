@@ -737,14 +737,33 @@ def generate_video(
         _trim_log[idx] = (start_t, end_t)
         return apply_without_mask(trimmed)
 
+    _load_errors: dict = {}  # path → error string for diagnostics
+
     def load_clip(path):
+        # First attempt: normal load (with audio)
         try:
             clip = VideoFileClip(path)
             if not clip.duration or clip.duration < MIN_KEEP_SEC:
                 clip.close()
+                _load_errors[path] = f"duration too short ({getattr(clip, 'duration', None)}s)"
                 return None
             return clip
-        except Exception:
+        except Exception as _exc:
+            print(f"⚠️ [load_clip] Normal load failed for {os.path.basename(path)}: {repr(_exc)}")
+            _load_errors[path] = repr(_exc)
+
+        # Fallback: try without audio (handles broken/incompatible audio streams)
+        try:
+            clip = VideoFileClip(path, audio=False)
+            if not clip.duration or clip.duration < MIN_KEEP_SEC:
+                clip.close()
+                _load_errors[path] = f"duration too short ({getattr(clip, 'duration', None)}s)"
+                return None
+            print(f"[load_clip] Loaded WITHOUT audio: {os.path.basename(path)}")
+            return clip
+        except Exception as _exc2:
+            print(f"⚠️ [load_clip] audio=False fallback also failed for {os.path.basename(path)}: {repr(_exc2)}")
+            _load_errors[path] = repr(_exc2)
             return None
 
     import gc
@@ -977,8 +996,12 @@ def generate_video(
         gc.collect()  # release frame buffers before loading the next clip
 
     if not clips:
-        # Give you useful info instead of the generic ValueError
-        preview = "\n".join(load_failures[:12]) if load_failures else "(no failure details)"
+        # Build a rich failure report so the error is actionable
+        failure_lines = []
+        for fp in load_failures[:12]:
+            reason = _load_errors.get(fp, "unknown")
+            failure_lines.append(f"  {fp}  →  {reason}")
+        preview = "\n".join(failure_lines) if failure_lines else "(no failure details)"
         # Clean up any temp files before raising
         for f in temp_files:
             try:

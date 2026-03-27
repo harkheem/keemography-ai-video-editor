@@ -670,6 +670,28 @@ function ClipAnalysis({ clips }) {
 // ─── Result panel ─────────────────────────────────────────────────────────────
 
 function ResultPanel({ jobId }) {
+  const [dlError, setDlError] = useState(null)
+
+  const handleDownload = async () => {
+    setDlError(null)
+    try {
+      const res = await fetch(`/api/download/${jobId}`)
+      if (!res.ok) {
+        const msg = await res.text()
+        throw new Error(`Download failed (${res.status}): ${msg}`)
+      }
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `keemography_${jobId.slice(0, 8)}.mp4`
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      setDlError(e.message)
+    }
+  }
+
   return (
     <div
       className="bg-gradient-to-br from-[#0b1508] to-[#080d08] border border-[#1a3a1a] rounded-2xl p-6 mt-4
@@ -684,18 +706,20 @@ function ResultPanel({ jobId }) {
         className="w-full rounded-xl bg-black mb-4"
         style={{ maxHeight: '340px' }}
       />
-      <a
-        href={`/api/download/${jobId}`}
-        download
+      <button
+        onClick={handleDownload}
         className={
           'block text-center w-full py-2.5 rounded-xl font-bold text-[#6de06d] ' +
           'bg-gradient-to-br from-[#0a1f0a] to-[#0e2e0e] border border-[#1a5c1a] ' +
           'shadow-[0_4px_16px_rgba(20,100,20,0.25)] hover:shadow-[0_6px_24px_rgba(20,100,20,0.4)] ' +
-          'transition-all'
+          'transition-all cursor-pointer w-full'
         }
       >
         📥 Download MP4
-      </a>
+      </button>
+      {dlError && (
+        <p className="text-red-400 text-xs mt-2 text-center">{dlError}</p>
+      )}
     </div>
   )
 }
@@ -820,6 +844,10 @@ export default function App() {
         },
         async (doneData) => {
           setJobStatus(doneData.status)
+          if (doneData.status === 'error' && doneData.error) {
+            setMessage(doneData.error)
+            setError(doneData.error)
+          }
           try {
             const s = await pollStatus(job_id)
             if (s.clip_analysis?.length) setClipAnalysis(s.clip_analysis)
