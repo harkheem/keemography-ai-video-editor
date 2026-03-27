@@ -5,6 +5,7 @@
 
 import gc
 import json
+import logging
 import os
 import re
 import shutil
@@ -44,6 +45,15 @@ try:
     load_dotenv(os.path.join(_ROOT, ".env"))
 except ImportError:
     pass
+
+# ── Suppress broken-pipe noise from uvicorn when clients disconnect early ─────
+class _SuppressBrokenPipe(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return "Broken pipe" not in msg and "Connection reset by peer" not in msg
+
+for _logger_name in ("uvicorn.error", "uvicorn.access", "asyncio"):
+    logging.getLogger(_logger_name).addFilter(_SuppressBrokenPipe())
 
 # ─────────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Keemography API", version="2.0.0")
