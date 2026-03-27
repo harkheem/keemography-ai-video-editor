@@ -463,24 +463,28 @@ async def job_events(job_id: str):
     async def _generate():
         import asyncio
         last_idx = 0
-        while True:
-            with _jobs_lock:
-                job = _jobs.get(job_id)
-            if not job:
-                yield f"data: {json.dumps({'error': 'not found'})}\n\n"
-                break
+        try:
+            while True:
+                with _jobs_lock:
+                    job = _jobs.get(job_id)
+                if not job:
+                    yield f"data: {json.dumps({'error': 'not found'})}\n\n"
+                    break
 
-            events = job["events"]
-            if len(events) > last_idx:
-                for ev in events[last_idx:]:
-                    yield f"data: {ev}\n\n"
-                last_idx = len(events)
+                events = job["events"]
+                if len(events) > last_idx:
+                    for ev in events[last_idx:]:
+                        yield f"data: {ev}\n\n"
+                    last_idx = len(events)
 
-            if job["status"] in ("done", "error"):
-                yield f"data: {json.dumps({'done': True, 'status': job['status'], 'error': job.get('error')})}\n\n"
-                break
+                if job["status"] in ("done", "error"):
+                    yield f"data: {json.dumps({'done': True, 'status': job['status'], 'error': job.get('error')})}\n\n"
+                    break
 
-            await asyncio.sleep(0.4)
+                await asyncio.sleep(0.4)
+        except (BrokenPipeError, GeneratorExit, ConnectionResetError):
+            # Client disconnected — job keeps running in background thread
+            pass
 
     return StreamingResponse(
         _generate(),
