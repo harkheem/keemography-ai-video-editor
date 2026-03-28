@@ -1218,19 +1218,31 @@ def generate_video(
     final = enforce_target_duration(final, target_duration_sec)
 
     # Write output
+    # h264_videotoolbox is macOS-only; skip the attempt entirely on Linux (Railway)
+    # to avoid an exception inside the except block aborting the libx264 fallback.
+    _use_hw = sys.platform == "darwin"
     temp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     try:
-        try:
-            # Try hardware-accelerated encoding on macOS (h264_videotoolbox); no 'preset' param
-            final.write_videofile(
-                temp_out.name,
-                codec="h264_videotoolbox",
-                audio_codec="aac",
-                fps=_fps,
-                threads=2,
-            )
-        except Exception as hw_err:
-            print(f"⚠️ Hardware encoding unavailable ({hw_err}), falling back to libx264...")
+        if _use_hw:
+            try:
+                final.write_videofile(
+                    temp_out.name,
+                    codec="h264_videotoolbox",
+                    audio_codec="aac",
+                    fps=_fps,
+                    threads=2,
+                )
+            except Exception as hw_err:
+                print(f"⚠️ Hardware encoding unavailable ({hw_err}), falling back to libx264...")
+                final.write_videofile(
+                    temp_out.name,
+                    codec="libx264",
+                    audio_codec="aac",
+                    fps=_fps,
+                    threads=2,
+                    preset="medium",
+                )
+        else:
             final.write_videofile(
                 temp_out.name,
                 codec="libx264",

@@ -46,6 +46,30 @@ try:
 except ImportError:
     pass
 
+# ── Make stdout/stderr writes non-fatal so print() never raises BrokenPipeError
+# This affects all modules (editor.py, scoring.py, app_utils.py) since they all
+# write to sys.stdout via print().  On Railway the log pipe can break mid-job,
+# which would abort the render inside an except block before the fallback runs.
+class _SafeStream:
+    """Wraps a text stream so that BrokenPipeError / OSError on write is silently discarded."""
+    def __init__(self, stream):
+        self._s = stream
+    def write(self, data):
+        try:
+            return self._s.write(data)
+        except (BrokenPipeError, OSError):
+            return 0
+    def flush(self):
+        try:
+            return self._s.flush()
+        except (BrokenPipeError, OSError):
+            pass
+    def __getattr__(self, attr):
+        return getattr(self._s, attr)
+
+sys.stdout = _SafeStream(sys.stdout)
+sys.stderr = _SafeStream(sys.stderr)
+
 # ── Suppress broken-pipe noise from uvicorn when clients disconnect early ─────
 class _SuppressBrokenPipe(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
