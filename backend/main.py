@@ -113,6 +113,50 @@ _jobs: Dict[str, Dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
 
 
+def _temp_sweeper() -> None:
+    """Background thread: delete orphaned tmp video/audio files older than 2 hours.
+
+    Runs every 30 minutes. Keeps files that are still referenced by an active job
+    so that Regenerate / Edit & Regenerate can reuse uploaded clips without re-uploading.
+    """
+    import glob
+    while True:
+        time.sleep(30 * 60)  # wait 30 min between sweeps
+        try:
+            # Collect all paths currently referenced by any job (running or done)
+            protected: set = set()
+            with _jobs_lock:
+                for job in _jobs.values():
+                    for key in ("result_path", "music_path"):
+                        p = job.get(key)
+                        if p:
+                            protected.add(p)
+                    for p in job.get("clip_paths", []):
+                        protected.add(p)
+
+            cutoff = time.time() - 2 * 3600  # 2 hours ago
+            tmp_dir = tempfile.gettempdir()
+            removed = 0
+            for pattern in ("*.mp4", "*.MP4", "*.mov", "*.MOV", "*.wav", "*.mp3"):
+                for path in glob.glob(os.path.join(tmp_dir, "tmp*" + pattern[1:])):
+                    if path in protected:
+                        continue
+                    try:
+                        if os.path.getmtime(path) < cutoff:
+                            os.remove(path)
+                            removed += 1
+                    except Exception:
+                        pass
+            if removed:
+                logging.info("[SWEEP] Removed %d orphaned temp file(s)", removed)
+        except Exception as _sweep_exc:
+            logging.warning("[SWEEP] Error: %s", repr(_sweep_exc))
+
+
+_sweeper_thread = threading.Thread(target=_temp_sweeper, daemon=True, name="temp-sweeper")
+_sweeper_thread.start()
+
+
 def _get_env_key() -> Optional[str]:
     return os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY")
 
@@ -444,19 +488,9 @@ def _run_job(job_id: str, params: dict) -> None:
                 json.dumps({"progress": -1, "message": f"Error: {e}"})
             )
 
-    finally:
-        # Delete uploaded input files (clips + music) to reclaim disk space.
-        # The output file is kept until the client downloads it (or calls DELETE /api/job/{id}).
-        _input_paths: List[str] = list(params.get("clip_paths", []))
-        _mp = params.get("music_path")
-        if _mp:
-            _input_paths.append(_mp)
-        for _p in _input_paths:
-            try:
-                if _p and os.path.exists(_p):
-                    os.remove(_p)
-            except Exception:
-                pass
+    # Note: input files are NOT deleted here so that Regenerate / Edit & Regenerate
+    # can reuse the same paths without re-uploading.  A background sweeper (started
+    # at app startup) removes orphaned temp files older than 2 hours.
 
 
 @app.post("/api/generate")
