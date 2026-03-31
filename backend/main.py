@@ -444,6 +444,20 @@ def _run_job(job_id: str, params: dict) -> None:
                 json.dumps({"progress": -1, "message": f"Error: {e}"})
             )
 
+    finally:
+        # Delete uploaded input files (clips + music) to reclaim disk space.
+        # The output file is kept until the client downloads it (or calls DELETE /api/job/{id}).
+        _input_paths: List[str] = list(params.get("clip_paths", []))
+        _mp = params.get("music_path")
+        if _mp:
+            _input_paths.append(_mp)
+        for _p in _input_paths:
+            try:
+                if _p and os.path.exists(_p):
+                    os.remove(_p)
+            except Exception:
+                pass
+
 
 @app.post("/api/generate")
 async def start_generate(
