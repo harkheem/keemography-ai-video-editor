@@ -126,6 +126,8 @@ export async function startGenerate(params) {
   form.append('mix_original_audio', String(params.mixOriginalAudio))
   form.append('show_opening_card', String(params.showOpeningCard))
   if (params.musicPath) form.append('music_path', params.musicPath)
+  form.append('music_start_sec', String(params.musicStartSec ?? 0))
+  if (params.musicEndSec != null) form.append('music_end_sec', String(params.musicEndSec))
   form.append('priority_keywords', params.priorityKeywords || '')
   form.append('exclude_keywords', params.excludeKeywords || '')
   if (params.apiKey) form.append('api_key', params.apiKey)

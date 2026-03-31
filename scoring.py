@@ -39,7 +39,8 @@ def _embed_texts(texts: Sequence[str], api_key: Optional[str]) -> np.ndarray:
 def _safe_embed_texts(texts: Sequence[str], api_key: Optional[str]) -> Optional[np.ndarray]:
     try:
         return _embed_texts(texts, api_key)
-    except Exception:
+    except Exception as _e:
+        print(f"⚠️ [SCORE] Embeddings unavailable ({repr(_e)}) — falling back to keyword matching")
         return None
 
 # ---------------------------------------------------------------------------
@@ -273,6 +274,7 @@ def _describe_clip_visually_gemini(
             video_file = genai.get_file(video_file.name)
 
         if video_file.state.name != "ACTIVE":
+            print(f"⚠️ [GEMINI] {os.path.basename(video_path)} not ACTIVE after upload: {video_file.state.name}")
             return dict(_VISUAL_DEFAULT)
 
         beats_text = ", ".join(story_beats[:4]) if story_beats else "hook, development, payoff"
@@ -377,7 +379,8 @@ def _describe_clip_visually_gemini(
             "trim_end_sec": ts_end,
             "segments": validated_segs,
         }
-    except Exception:
+    except Exception as _e:
+        print(f"⚠️ [GEMINI] Analysis failed for {os.path.basename(video_path)}: {repr(_e)}")
         return dict(_VISUAL_DEFAULT)
 
 
@@ -398,6 +401,7 @@ def _describe_clip_visually(
       trim_end_sec     — recommended trim window end
     """
     if not frames_with_ts or not api_key:
+        print(f"⚠️ [GPT4V] No frames or no API key — skipping vision analysis, using defaults")
         return dict(_VISUAL_DEFAULT)
     try:
         from openai import OpenAI
@@ -551,7 +555,8 @@ def _describe_clip_visually(
             "trim_end_sec":    ts_end,
             "segments":        validated_segs,
         }
-    except Exception:
+    except Exception as _e:
+        print(f"⚠️ [GPT4V] Analysis failed: {repr(_e)}")
         return dict(_VISUAL_DEFAULT)
 
 
@@ -563,7 +568,7 @@ def _score_clips_visually(
     max_workers: int = 2,  # 2 instead of 4 — each worker holds frame data in RAM
     story_beats: Optional[List[str]] = None,
     progress_callback: Optional[callable] = None,  # (done: int, total: int, clip_name: str)
-) -> Dict[str, Dict]:
+) -> Tuple[Dict[str, Dict], int]:  # returns (visual_meta, failed_count)
     """
     Run visual analysis concurrently for all clips.
     Uses Gemini 2.0 Flash (native video) when GOOGLE_API_KEY is set,
@@ -616,15 +621,21 @@ def _score_clips_visually(
     results: Dict[str, Dict] = {}
     total = len(transcriptions)
     done = 0
+    failed_count = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {ex.submit(_analyse, t): t for t in transcriptions}
         for fut in concurrent.futures.as_completed(futures):
             try:
                 path, meta = fut.result()
-            except Exception:
+                # Count clips that fell back to defaults (AI analysis didn't run)
+                if meta == _VISUAL_DEFAULT or meta.get("visual_score") == 0.5 and not meta.get("description"):
+                    failed_count += 1
+            except Exception as _thread_exc:
                 t = futures[fut]
                 path = t.get("path", "")
+                print(f"⚠️ [VISION] Thread failed for {os.path.basename(path)}: {repr(_thread_exc)}")
                 meta = dict(_VISUAL_DEFAULT)
+                failed_count += 1
             if path:
                 results[path] = meta
             done += 1
@@ -634,7 +645,7 @@ def _score_clips_visually(
                     progress_callback(done, total, clip_name)
                 except Exception:
                     pass
-    return results
+    return results, failed_count
 
 
 # ---------------------------------------------------------------------------
@@ -757,8 +768,14 @@ def _fix_shot_continuity(
 
 def _split_story_into_segments(story: str) -> List[str]:
     parts = re.split(r"[\n\.!?;:]+", story or "")
-    segments = [p.strip() for p in parts if p and p.strip()]
-    return segments[:8] if segments else [" "]
+    segments = [p.strip() for p in parts if p and len(p.strip()) > 3]
+    if not segments:
+        base = (story or "").strip() or "general video"
+        return [base, base, base]
+    # Single-sentence story: synthesize 3 variants so beat matching has surface area
+    if len(segments) == 1:
+        return [segments[0], segments[0], segments[0]]
+    return segments[:8]
 
 def _tokenize(text: str) -> List[str]:
     return re.findall(r"[a-zA-Z0-9']+", (text or "").lower())
@@ -1032,6 +1049,7 @@ def score_clips_with_story(
     """
     api_key = _get_api_key(openai_api_key)
     if not api_key:
+        print("⚠️ [SCORE] No API key — skipping all AI analysis, using defaults for all clips")
         return [{"path": t["path"], "narrative_role": "development",
                  "shot_type": "unknown", "emotion": "neutral", "visual_score": 0.5}
                 for t in transcriptions if t.get("path")]
@@ -1044,14 +1062,37 @@ def score_clips_with_story(
     # We run planning synchronously — it's fast (gpt-4o-mini) and short.
     # The beats go into every per-clip GPT-4o prompt as context so the model
     # knows which narrative moment each clip should serve.
-    story_segments = _llm_story_plan(story_text, api_key, tone) or _split_story_into_segments(story_text)
+    _llm_plan = _llm_story_plan(story_text, api_key, tone)
+    if not _llm_plan:
+        print("⚠️ [SCORE] LLM story plan failed — using punctuation split as fallback")
+    story_segments = _llm_plan or _split_story_into_segments(story_text)
 
     # ── Step 2: visual analysis with story beats as context ───────────────
-    visual_meta: Dict[str, Dict] = _score_clips_visually(
+    visual_meta: Dict[str, Dict]
+    visual_meta, _failed_clips = _score_clips_visually(
         transcriptions, story_text, tone or "", api_key,
         story_beats=story_segments,
         progress_callback=progress_callback,
     )
+    if _failed_clips > 0:
+        print(f"⚠️ [SCORE] {_failed_clips}/{len(transcriptions)} clip(s) fell back to default metadata (AI analysis unavailable)")
+
+    # ── Normalize visual_score across batch ───────────────────────────────
+    # GPT-4o scores cluster in 0.6-0.85; normalizing to [0.15, 0.95] gives
+    # the allocation engine 5× more differentiation between clips.
+    _vs_values = [
+        float(visual_meta.get(t.get("path", ""), {}).get("visual_score", 0.5))
+        for t in transcriptions
+    ]
+    _vs_min, _vs_max = min(_vs_values), max(_vs_values)
+    if _vs_max - _vs_min > 0.05:
+        for t in transcriptions:
+            p = t.get("path", "")
+            if p in visual_meta:
+                raw_vs = float(visual_meta[p].get("visual_score", 0.5))
+                normalized = 0.15 + 0.80 * (raw_vs - _vs_min) / (_vs_max - _vs_min)
+                visual_meta[p]["visual_score"] = round(normalized, 4)
+
     story_keywords = _auto_keywords(story_text)
 
     pri = set((priority_keywords or []))
@@ -1084,6 +1125,7 @@ def score_clips_with_story(
     target_k = max(4, min(len(texts), desired_clip_count))
 
     if clip_vecs is None or segment_vecs is None:
+        print("⚠️ [SCORE] Embeddings unavailable — falling back to visual score + keyword matching (no semantic story matching)")
         # No embeddings: use visual score + lexical as fallback
         ranked = sorted(
             range(len(texts)),

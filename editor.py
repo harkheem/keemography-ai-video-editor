@@ -160,6 +160,90 @@ def detect_beats(audio_path: str) -> list[float]:
         return []
 
 
+def analyze_music_for_trim(audio_path: str, target_duration_sec: float = 45.0) -> dict:
+    """
+    Analyze a music file and suggest the best trim window using librosa.
+    Blends RMS energy (60%) + onset strength (40%) into a highlight score,
+    then finds the sliding window of target_duration_sec with the highest score.
+
+    Returns:
+        { duration, suggested_start, suggested_end, energy_peaks }
+    Falls back to { duration, suggested_start=0, suggested_end=min(dur, target), energy_peaks=[] }
+    on any error.
+    """
+    try:
+        from scipy.ndimage import gaussian_filter1d
+        y, sr = librosa.load(audio_path, sr=None, mono=True)
+        total_duration = float(librosa.get_duration(y=y, sr=sr))
+
+        if total_duration <= target_duration_sec:
+            # Track is shorter than target — no trimming needed; suggest full range
+            return {
+                "duration": round(total_duration, 2),
+                "suggested_start": 0.0,
+                "suggested_end": round(total_duration, 2),
+                "energy_peaks": [],
+            }
+
+        hop_length = 512
+        rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
+        onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
+
+        # Pad or trim to same length
+        min_len = min(len(rms), len(onset_env))
+        rms = rms[:min_len]
+        onset_env = onset_env[:min_len]
+
+        rms_norm = rms / (rms.max() + 1e-9)
+        onset_norm = onset_env / (onset_env.max() + 1e-9)
+        highlight = 0.6 * rms_norm + 0.4 * onset_norm
+
+        # Smooth to avoid picking a single loud transient
+        sigma = max(1, int(sr / hop_length))  # ~1 second of smoothing
+        highlight = gaussian_filter1d(highlight, sigma=sigma)
+
+        times = librosa.frames_to_time(np.arange(len(highlight)), sr=sr, hop_length=hop_length)
+        window_frames = int(target_duration_sec * sr / hop_length)
+        window_frames = min(window_frames, len(highlight) - 1)
+
+        best_start_frame = 0
+        best_score = -1.0
+        for i in range(len(highlight) - window_frames):
+            score = float(np.mean(highlight[i: i + window_frames]))
+            if score > best_score:
+                best_score = score
+                best_start_frame = i
+
+        suggested_start = float(times[best_start_frame])
+        suggested_end = min(total_duration, suggested_start + target_duration_sec)
+
+        # Top-5 energy peaks for optional frontend display
+        peak_frames = np.argsort(highlight)[-5:][::-1].tolist()
+        energy_peaks = sorted([
+            round(float(times[min(f, len(times) - 1)]), 2) for f in peak_frames
+        ])
+
+        return {
+            "duration": round(total_duration, 2),
+            "suggested_start": round(suggested_start, 2),
+            "suggested_end": round(suggested_end, 2),
+            "energy_peaks": energy_peaks,
+        }
+    except Exception as e:
+        print(f"⚠️ [MUSIC] Analysis failed for {os.path.basename(audio_path)}: {repr(e)}")
+        try:
+            from app_utils import probe_duration_seconds
+            dur = probe_duration_seconds(audio_path)
+        except Exception:
+            dur = 0.0
+        return {
+            "duration": round(dur, 2),
+            "suggested_start": 0.0,
+            "suggested_end": round(min(dur, target_duration_sec), 2),
+            "energy_peaks": [],
+        }
+
+
 # ── 4K proxy helpers ──────────────────────────────────────────────────────────
 
 def _probe_resolution(path: str) -> tuple:
@@ -386,6 +470,8 @@ def generate_video(
     mix_original_audio: bool = False,
     show_opening_card: bool = True,
     custom_music_path: Optional[str] = None,
+    music_start_sec: float = 0.0,
+    music_end_sec: Optional[float] = None,
     clip_metadata: Optional[Dict[str, Dict]] = None,  # keyed by path; from scoring
 ) -> str:
     """
@@ -530,19 +616,22 @@ def generate_video(
             return video_clip.with_audio(audio_clip)
         return video_clip
 
-    def normalize_audio_for_mix(input_path: str) -> Optional[str]:
+    def normalize_audio_for_mix(
+        input_path: str,
+        start_sec: float = 0.0,
+        end_sec: Optional[float] = None,
+    ) -> Optional[str]:
         if not input_path or not os.path.exists(input_path):
             return None
         out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", input_path,
-            "-vn",
-            "-ac", "2",
-            "-ar", "44100",
-            "-c:a", "pcm_s16le",
-            out_path,
-        ]
+        cmd = ["ffmpeg", "-y"]
+        # Seek before input for fast seeking (re-encode anyway so quality is fine)
+        if start_sec and start_sec > 0.0:
+            cmd += ["-ss", str(round(start_sec, 3))]
+        cmd += ["-i", input_path]
+        if end_sec is not None and end_sec > (start_sec or 0.0):
+            cmd += ["-t", str(round(end_sec - (start_sec or 0.0), 3))]
+        cmd += ["-vn", "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", out_path]
         try:
             subprocess.run(cmd, check=True, capture_output=True, text=True)
             temp_files.append(out_path)
@@ -831,7 +920,7 @@ def generate_video(
     #   visual_score    — higher quality = more time (scaled to avoid starving)
     #   emotion         — emotionally heavy clips need longer to land
     #   story_weight    — overlap with user storyline = extra budget
-    #   _trim_mult      — tone compression (energetic edits trim more overall)
+    #   _trim_mult      — tone compression: caps per-clip ceiling (energetic = shorter shots)
     _ROLE_WEIGHT = {
         "hook":        1.20,   # sets the tone — short but visible
         "payoff":      1.65,   # climax — deserves the most time
@@ -905,7 +994,8 @@ def generate_video(
             * (0.35 + 0.65 * max(0.0, min(1.0, vs)))  # quality, not starving low scores
             * _EMOTION_WEIGHT.get(emo, 0.90)
             * (1.0 + 0.25 * sw)                        # story overlap bonus
-            * _trim_mult                                # tone-level compression
+            # _trim_mult intentionally NOT here — it cancels in normalization;
+            # instead applied to per-clip ceilings below so it actually has effect
         )
         _raw_weights.append(max(0.01, w))
 
@@ -927,9 +1017,16 @@ def generate_video(
     # budget. With 2 clips, 0.45*2=0.90 — always 10% short. Use max(0.45, 1/N).
     CEIL_RATIO = max(0.45, 1.0 / max(1, _N))
 
-    # Per-clip hard ceiling: actual available footage OR the ratio cap, whichever
-    # is smaller. Ensures we never ask a clip for more than it has.
-    _ceilings = [max(FLOOR, min(_clip_durs[i], desired_total * CEIL_RATIO))
+    # Tone-modulated per-clip ceiling: _trim_mult controls how long individual shots
+    # can run — energetic (0.65) = shorter shots/more cuts, calm (1.35) = longer shots.
+    # Floor at 50% of equal share so budget holes don't force excessive freeze-frame padding.
+    _tone_ceil = max(
+        (desired_total / max(1, _N)) * _trim_mult,
+        (desired_total / max(1, _N)) * 0.50,
+    )
+
+    # Per-clip hard ceiling: actual footage OR monopoly cap OR tone cap, whichever is smallest.
+    _ceilings = [max(FLOOR, min(_clip_durs[i], desired_total * CEIL_RATIO, _tone_ceil))
                  for i in range(_N)]
 
     # ── Iterative saturation allocation ─────────────────────────────────────
@@ -1070,18 +1167,27 @@ def generate_video(
     if beat_times and len(beat_times) >= len(clips):
         # Use beat times as cut points for each clip
         cut_points = beat_times[:len(clips)]
-        # Optionally, trim/extend clips to match beat intervals
-        for i, c in enumerate(clips):
-            if i < len(cut_points)-1:
-                start = cut_points[i]
-                end = cut_points[i+1]
-                beat_len = end - start
-                if beat_len > 0 and c.duration > beat_len:
-                    clips[i] = apply_subclip(c, 0, beat_len)
-                    # Update trim log: keep the chosen start, shorten the window
-                    if i in _trim_log:
-                        _s0, _ = _trim_log[i]
-                        _trim_log[i] = (_s0, _s0 + beat_len)
+
+        # Gate: skip clip trimming when music is faster than 1 beat/sec on average.
+        # At 120 BPM beats are ~0.5s apart — trimming clips to that destroys content.
+        # cut_points is still populated above so it remains available for future sync features.
+        _avg_beat_interval = (
+            (beat_times[-1] - beat_times[0]) / max(1, len(beat_times) - 1)
+            if len(beat_times) >= 2 else 0.0
+        )
+        if _avg_beat_interval >= 1.0:
+            for i, c in enumerate(clips):
+                if i < len(cut_points) - 1:
+                    beat_len = cut_points[i + 1] - cut_points[i]
+                    # Floor: never trim below what the allocation engine computed.
+                    # _alloc_final is indexed 1:1 with clips (both built from _expanded).
+                    effective_beat_len = max(beat_len, _alloc_final[i])
+                    if effective_beat_len > 0 and c.duration > effective_beat_len:
+                        clips[i] = apply_subclip(c, 0, effective_beat_len)
+                        # Update trim log: keep the chosen start, shorten the window
+                        if i in _trim_log:
+                            _s0, _ = _trim_log[i]
+                            _trim_log[i] = (_s0, _s0 + effective_beat_len)
 
     # Safe to close raw clips now — beat alignment (the last reader-dependent
     # operation on trimmed subclips) is complete.
@@ -1175,7 +1281,11 @@ def generate_video(
     # Background music
     music_path = None
     if custom_music_path and os.path.exists(custom_music_path):
-        normalized_custom = normalize_audio_for_mix(custom_music_path)
+        normalized_custom = normalize_audio_for_mix(
+            custom_music_path,
+            start_sec=music_start_sec,
+            end_sec=music_end_sec,
+        )
         music_path = normalized_custom or custom_music_path
     else:
         music_path = _get_music_for_tone(tone)

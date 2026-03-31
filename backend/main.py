@@ -257,7 +257,15 @@ async def upload_music(request: Request):
             tmp.write(chunk)
             size += len(chunk)
         path = tmp.name
-    return {"name": f.filename, "path": path, "size": size}
+    # AI music analysis: find the best segment matching the user's target duration
+    try:
+        from editor import analyze_music_for_trim
+        _target = 45.0  # default; frontend will re-suggest when user changes target
+        analysis = analyze_music_for_trim(path, target_duration_sec=_target)
+    except Exception as _ae:
+        logging.warning("[MUSIC] Analysis failed: %s", repr(_ae))
+        analysis = {"duration": 0.0, "suggested_start": 0.0, "suggested_end": 0.0, "energy_peaks": []}
+    return {"name": f.filename, "path": path, "size": size, "analysis": analysis}
 
 
 @app.post("/api/fetch-url")
@@ -297,6 +305,9 @@ def _run_job(job_id: str, params: dict) -> None:
     mix_original_audio: bool = bool(params.get("mix_original_audio", False))
     show_opening_card: bool = bool(params.get("show_opening_card", True))
     music_path: Optional[str] = params.get("music_path") or None
+    music_start_sec: float = float(params.get("music_start_sec") or 0.0)
+    _raw_end = params.get("music_end_sec")
+    music_end_sec: Optional[float] = float(_raw_end) if _raw_end is not None else None
     priority_keywords: List[str] = params.get("priority_keywords", [])
     exclude_keywords: List[str] = params.get("exclude_keywords", [])
     api_key: Optional[str] = params.get("api_key") or _get_env_key()
@@ -361,6 +372,7 @@ def _run_job(job_id: str, params: dict) -> None:
                         "best_moment_sec": item.get("best_moment_sec"),
                         "trim_start_sec":  item.get("trim_start_sec"),
                         "trim_end_sec":    item.get("trim_end_sec"),
+                        "segments":        item.get("segments") or [],
                     }
 
         if not relevant_paths:
@@ -381,6 +393,8 @@ def _run_job(job_id: str, params: dict) -> None:
             mix_original_audio=mix_original_audio,
             show_opening_card=show_opening_card,
             custom_music_path=music_path,
+            music_start_sec=music_start_sec,
+            music_end_sec=music_end_sec,
             clip_metadata=clip_metadata,
         )
         gc.collect()
@@ -441,6 +455,8 @@ async def start_generate(
     mix_original_audio: bool = Form(False),
     show_opening_card: bool = Form(True),
     music_path: Optional[str] = Form(None),
+    music_start_sec: float = Form(0.0),
+    music_end_sec: Optional[float] = Form(None),
     priority_keywords: str = Form(""),
     exclude_keywords: str = Form(""),
     api_key: Optional[str] = Form(None),
@@ -478,6 +494,8 @@ async def start_generate(
         "mix_original_audio": mix_original_audio,
         "show_opening_card": show_opening_card,
         "music_path": music_path,
+        "music_start_sec": music_start_sec,
+        "music_end_sec": music_end_sec,
         "priority_keywords": [k.strip() for k in priority_keywords.split(",") if k.strip()],
         "exclude_keywords": [k.strip() for k in exclude_keywords.split(",") if k.strip()],
         "api_key": api_key,

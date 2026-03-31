@@ -362,7 +362,13 @@ function UrlFetcher({ onAdd }) {
 
 // ─── Music upload ─────────────────────────────────────────────────────────────
 
-function MusicUpload({ musicInfo, onSet, onClear }) {
+function fmtTime(sec) {
+  if (sec == null || isNaN(sec)) return '0:00'
+  const s = Math.round(sec)
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
+}
+
+function MusicUpload({ musicInfo, musicTrim, onSet, onTrimChange, onClear }) {
   const inputRef = useRef()
   const [uploading, setUploading] = useState(false)
   const [error, setError] = useState('')
@@ -385,29 +391,91 @@ function MusicUpload({ musicInfo, onSet, onClear }) {
     }
   }
 
+  const analysis = musicInfo?.analysis
+  const duration = analysis?.duration || 0
+  const showSliders = musicInfo && duration > 0
+  const trimStart = musicTrim?.start ?? 0
+  const trimEnd = musicTrim?.end ?? duration
+
   return (
     <div>
       <input
         ref={inputRef}
         type="file"
         accept=".mp3,.wav,.m4a,.aac,.ogg,audio/*"
+        className="hidden"
         onChange={(e) => handleFile(e.target.files[0])}
       />
       {musicInfo ? (
-        <div className="flex items-center gap-2 bg-[#0d0d0d] border border-[#1c1c1c] rounded-xl px-3 py-2">
-          <span className="text-green-400 text-sm">♪</span>
-          <span className="text-[0.82rem] text-[#ccc] flex-1 truncate">{musicInfo.name}</span>
-          <span className="text-[0.72rem] text-[#555]">{fmtBytes(musicInfo.size)}</span>
-          <button
-            onClick={onClear}
-            className="text-[#333] hover:text-[#e63939] text-xs ml-1"
-          >
-            ✕
-          </button>
+        <div className="space-y-3">
+          {/* File badge */}
+          <div className="flex items-center gap-2 bg-[#0d0d0d] border border-[#1c1c1c] rounded-xl px-3 py-2">
+            <span className="text-green-400 text-sm">♪</span>
+            <span className="text-[0.82rem] text-[#ccc] flex-1 truncate">{musicInfo.name}</span>
+            {duration > 0 && (
+              <span className="text-[0.72rem] text-[#555]">{fmtTime(duration)}</span>
+            )}
+            <span className="text-[0.72rem] text-[#444] mx-1">{fmtBytes(musicInfo.size)}</span>
+            <button onClick={onClear} className="text-[#333] hover:text-[#e63939] text-xs ml-1">✕</button>
+          </div>
+
+          {/* AI-powered trim sliders */}
+          {showSliders && (
+            <div className="bg-[#0a0a0a] border border-[#1a1a1a] rounded-xl px-3 py-3 space-y-3">
+              <div className="flex justify-between items-center">
+                <p className="text-[0.75rem] text-[#888] font-medium">Trim music</p>
+                <span className={`text-[0.62rem] px-2 py-0.5 rounded-full border font-semibold ${
+                  musicTrim?.aiSuggested
+                    ? 'bg-[#0a1f0a] border-[#1a5c1a] text-[#4caf50]'
+                    : 'bg-[#1a0808] border-[#e63939] text-[#ff7070]'
+                }`}>
+                  {musicTrim?.aiSuggested ? 'AI Suggested' : 'Custom'}
+                </span>
+              </div>
+
+              {/* Start slider */}
+              <div>
+                <div className="flex justify-between mb-1">
+                  <span className="text-[0.65rem] text-[#555]">Start</span>
+                  <span className="text-[0.65rem] text-[#aaa]">{fmtTime(trimStart)}</span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={Math.max(0, duration - 5)}
+                  step={1}
+                  value={trimStart}
+                  onChange={(e) => onTrimChange({ start: Number(e.target.value), end: trimEnd })}
+                  className="w-full accent-[#e63939] bg-[#252525] rounded-full h-1 cursor-pointer"
+                />
+              </div>
+
+              {/* End slider */}
+              <div>
+                <div className="flex justify-between mb-1">
+                  <span className="text-[0.65rem] text-[#555]">End</span>
+                  <span className="text-[0.65rem] text-[#aaa]">{fmtTime(trimEnd)}</span>
+                </div>
+                <input
+                  type="range"
+                  min={trimStart + 5}
+                  max={duration}
+                  step={1}
+                  value={trimEnd}
+                  onChange={(e) => onTrimChange({ start: trimStart, end: Number(e.target.value) })}
+                  className="w-full accent-[#e63939] bg-[#252525] rounded-full h-1 cursor-pointer"
+                />
+              </div>
+
+              <p className="text-[0.62rem] text-[#444]">
+                Using {fmtTime(trimEnd - trimStart)} of {fmtTime(duration)} track
+              </p>
+            </div>
+          )}
         </div>
       ) : (
         <Btn onClick={() => !uploading && inputRef.current.click()} disabled={uploading}>
-          {uploading ? 'Uploading…' : '+ Upload MP3 / WAV (optional)'}
+          {uploading ? 'Analyzing…' : '+ Upload MP3 / WAV (optional)'}
         </Btn>
       )}
       {error && <p className="text-[#e63939] text-xs mt-1">{error}</p>}
@@ -786,6 +854,7 @@ export default function App() {
   const [clips, setClips] = useState([])
   const [storyline, setStoryline] = useState('')
   const [musicInfo, setMusicInfo] = useState(null)
+  const [musicTrim, setMusicTrim] = useState({ start: 0, end: null, aiSuggested: true })
   const [priorityKw, setPriorityKw] = useState('')
   const [excludeKw, setExcludeKw] = useState('')
   const [settings, setSettings] = useState(DEFAULT_SETTINGS)
@@ -830,6 +899,8 @@ export default function App() {
         mixOriginalAudio: settings.mixOriginalAudio,
         showOpeningCard: settings.showOpeningCard,
         musicPath: musicInfo?.path || null,
+        musicStartSec: musicTrim.start,
+        musicEndSec: musicTrim.end,
         priorityKeywords: priorityKw,
         excludeKeywords: excludeKw,
         apiKey: apiKeyInput || null,
@@ -955,8 +1026,19 @@ export default function App() {
               </Label>
               <MusicUpload
                 musicInfo={musicInfo}
-                onSet={setMusicInfo}
-                onClear={() => setMusicInfo(null)}
+                musicTrim={musicTrim}
+                onSet={(info) => {
+                  setMusicInfo(info)
+                  // Pre-populate trim from AI suggestion
+                  const a = info?.analysis
+                  if (a && a.duration > 0) {
+                    setMusicTrim({ start: a.suggested_start, end: a.suggested_end, aiSuggested: true })
+                  } else {
+                    setMusicTrim({ start: 0, end: null, aiSuggested: true })
+                  }
+                }}
+                onTrimChange={(trim) => setMusicTrim({ ...trim, aiSuggested: false })}
+                onClear={() => { setMusicInfo(null); setMusicTrim({ start: 0, end: null, aiSuggested: true }) }}
               />
             </Panel>
 
