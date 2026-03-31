@@ -628,7 +628,7 @@ def _score_clips_visually(
             try:
                 path, meta = fut.result()
                 # Count clips that fell back to defaults (AI analysis didn't run)
-                if meta == _VISUAL_DEFAULT or meta.get("visual_score") == 0.5 and not meta.get("description"):
+                if meta == _VISUAL_DEFAULT or (meta.get("visual_score") == 0.5 and not meta.get("description")):
                     failed_count += 1
             except Exception as _thread_exc:
                 t = futures[fut]
@@ -816,10 +816,26 @@ def _lexical_overlap(text: str, keywords: set[str]) -> float:
     matches = len(tokens.intersection(keywords))
     return matches / max(1, len(keywords))
 
-def _mmr_select(indices: List[int], rel_scores: np.ndarray, embeds: np.ndarray, k: int, lam: float = 0.78) -> List[int]:
+def _mmr_select(
+    indices: List[int],
+    rel_scores: np.ndarray,
+    embeds: np.ndarray,
+    k: int,
+    lam: float = 0.78,
+    shot_types: Optional[List[str]] = None,
+) -> List[int]:
+    """Maximal Marginal Relevance with optional shot-type diversity penalty.
+
+    shot_types, when provided, must be indexed 1:1 with rel_scores/embeds.
+    Each additional clip of the same shot_type loses 0.10 score after the
+    first occurrence — forcing visual variety at selection time.
+    """
     if not indices:
         return []
     chosen = [max(indices, key=lambda i: rel_scores[i])]
+    selected_shots: List[Optional[str]] = [
+        shot_types[chosen[0]] if shot_types else None
+    ]
     remaining = set(indices) - set(chosen)
     while remaining and len(chosen) < k:
         best_i = None
@@ -827,12 +843,30 @@ def _mmr_select(indices: List[int], rel_scores: np.ndarray, embeds: np.ndarray, 
         for i in remaining:
             redundancy = max(_cosine_sim(embeds[i], embeds[j]) for j in chosen) if chosen else 0.0
             score = lam * float(rel_scores[i]) - (1.0 - lam) * float(redundancy)
+            # Shot-type diversity penalty: -0.10 per duplicate beyond first occurrence.
+            # Prevents selecting 3 wide shots when a close-up exists (even if slightly
+            # less relevant) — mimics how a human editor enforces visual variety.
+            if shot_types:
+                cand_shot = shot_types[i]
+                already = sum(1 for s in selected_shots if s == cand_shot)
+                score -= 0.10 * max(0, already - 1)
             if score > best_score:
                 best_score = score
                 best_i = i
         chosen.append(best_i)
+        selected_shots.append(shot_types[best_i] if shot_types else None)
         remaining.remove(best_i)
     return chosen
+
+# Desired emotional arc per tone — used in the editorial rerank prompt so GPT-4o
+# reasons about sequence shape, not just semantic similarity.
+_ARC_DESCRIPTIONS: Dict[str, str] = {
+    "energetic":   "start high-energy → build excitement → dramatic peak → strong close",
+    "epic":        "powerful open → tension builds → dramatic crescendo → triumphant close",
+    "cinematic":   "intriguing open → develop story beats → emotional turn → inspiring payoff",
+    "sentimental": "gentle open → personal moments → emotional depth → uplifting resolution",
+    "calm":        "peaceful establish → gentle journey → quiet reflection → serene close",
+}
 
 def _llm_editorial_rerank(
     story: str,
@@ -840,7 +874,13 @@ def _llm_editorial_rerank(
     candidate_indices: List[int],
     api_key: Optional[str],
     tone: Optional[str] = None,
+    visual_meta: Optional[Dict[str, Dict]] = None,
 ) -> Optional[List[int]]:
+    """Reorder candidate clips for narrative flow using GPT-4o.
+
+    Now passes full visual context (shot_type, emotion, narrative_role, description)
+    so the LLM can reason like a real editor — not just by transcript text.
+    """
     if not api_key or not candidate_indices:
         return None
 
@@ -848,29 +888,48 @@ def _llm_editorial_rerank(
         from openai import OpenAI
 
         client = OpenAI(api_key=api_key)
-        tone_label = (tone or "").strip() or "cinematic"
+        tone_label = (tone or "cinematic").strip().lower()
+        arc_desc = _ARC_DESCRIPTIONS.get(tone_label, "hook → development → emotional peak → payoff")
 
-        payload = []
+        # Build enriched clip descriptions: id | SHOT | emotion | role | visual desc | transcript
+        clip_lines = []
         for idx in candidate_indices:
-            text = str(transcriptions[idx].get("text", "") or "").strip()
+            t = transcriptions[idx]
+            path = t.get("path", "")
+            text = str(t.get("text", "") or "").strip()
             text = re.sub(r"\s+", " ", text)
-            payload.append({
-                "id": idx,
-                "transcript": text[:280],
-            })
 
-        prompt = {
-            "task": "Order candidate clips into the best narrative sequence for a short edit.",
-            "constraints": [
-                "Prefer coherent story flow: hook -> development -> payoff.",
-                "Avoid clips with gibberish/low-information text unless necessary.",
-                "Prioritize emotional and semantic relevance to the story.",
-                "Return ONLY JSON with key 'order' as list of clip ids.",
-            ],
-            "tone": tone_label,
-            "story": story,
-            "candidates": payload,
-        }
+            vm = (visual_meta or {}).get(path, {})
+            shot = (vm.get("shot_type") or "unknown").upper()
+            emo  = vm.get("emotion") or "neutral"
+            role = vm.get("narrative_role") or "development"
+            desc = (vm.get("description") or "").strip()
+
+            line = f"{idx} | {shot} | {emo} | {role}"
+            if desc:
+                line += f" | {desc[:80]}"
+            if text:
+                line += f' | "{text[:120]}"'
+            clip_lines.append(line)
+
+        clips_block = "\n".join(clip_lines)
+        prompt_text = (
+            f"You are a professional video editor. Arrange these clips into a compelling sequence.\n\n"
+            f"Tone: {tone_label}\n"
+            f"Story: {story}\n"
+            f"Desired emotional arc: {arc_desc}\n\n"
+            f"CLIPS (id | shot_type | emotion | role | description | transcript):\n"
+            f"{clips_block}\n\n"
+            f"Apply professional editorial rules:\n"
+            f"- OPENING (first clip): use action, striking visual, or emotional hook — never static/generic\n"
+            f"- VISUAL VARIETY: avoid placing same shot_type back-to-back (aim for wide→medium→close progression)\n"
+            f"- EMOTIONAL FLOW: match the arc — {arc_desc}\n"
+            f"- CLOSING (last clip): use resolution or payoff — emotional or wide establishing shot\n"
+            f"- B-ROLL (role=broll): use to break up talking-head runs, not as filler\n\n"
+            f"Return ONLY a JSON object with key 'order' as an array of clip ids."
+        )
+
+        print(f"[EDITORIAL] Reranking {len(candidate_indices)} clips with visual context (tone={tone_label})")
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -882,10 +941,10 @@ def _llm_editorial_rerank(
                 },
                 {
                     "role": "user",
-                    "content": json.dumps(prompt, ensure_ascii=False),
+                    "content": prompt_text,
                 },
             ],
-            max_tokens=220,
+            max_tokens=300,
             response_format={"type": "json_object"},
         )
 
@@ -910,7 +969,8 @@ def _llm_editorial_rerank(
                 cleaned.append(idx)
 
         return cleaned if cleaned else None
-    except Exception:
+    except Exception as _e:
+        print(f"⚠️ [EDITORIAL] LLM rerank failed: {repr(_e)}")
         return None
 
 def _llm_story_plan(story: str, api_key: Optional[str], tone: Optional[str] = None) -> Optional[List[str]]:
@@ -1028,6 +1088,57 @@ def _llm_continuity_check(
         return ordered
     except Exception:
         return ordered
+
+
+def _pin_hook_and_payoff(result: List[Dict]) -> List[Dict]:
+    """Ensure the edit opens with the best hook and closes with the best payoff.
+
+    A human editor agonizes over the opening and closing shots. This function
+    enforces that invariant after all other ordering passes are complete.
+    - Opening: highest hook_score (narrative_role==hook OR exciting/dramatic/inspiring emotion
+      AND wide/action shot_type)
+    - Closing: highest payoff_score (narrative_role==payoff OR inspiring/happy/dramatic emotion)
+    Only swaps if a better candidate exists elsewhere in the list.
+    """
+    if len(result) < 3:
+        return result
+
+    _hook_emotions = {"exciting", "dramatic", "inspiring"}
+    _hook_shots    = {"wide", "action", "extreme_wide", "landscape"}
+    _payoff_emotions = {"inspiring", "happy", "dramatic", "calm"}
+    _payoff_shots    = {"wide", "extreme_wide", "close_up", "landscape"}
+
+    def _hook_score(clip: Dict) -> float:
+        s = 0.0
+        if clip.get("narrative_role") == "hook":              s += 2.0
+        if clip.get("emotion") in _hook_emotions:             s += 1.0
+        if clip.get("shot_type") in _hook_shots:              s += 0.5
+        s += float(clip.get("visual_score") or 0.5)
+        return s
+
+    def _payoff_score(clip: Dict) -> float:
+        s = 0.0
+        if clip.get("narrative_role") == "payoff":            s += 2.0
+        if clip.get("emotion") in _payoff_emotions:           s += 1.0
+        if clip.get("shot_type") in _payoff_shots:            s += 0.5
+        s += float(clip.get("visual_score") or 0.5)
+        return s
+
+    # Pin opening: find best hook anywhere except the last position
+    best_hook_idx = max(range(len(result) - 1), key=lambda i: _hook_score(result[i]))
+    if best_hook_idx != 0:
+        result[0], result[best_hook_idx] = result[best_hook_idx], result[0]
+
+    # Pin closing: find best payoff anywhere except the first position (now pinned)
+    best_payoff_idx = max(range(1, len(result)), key=lambda i: _payoff_score(result[i]))
+    if best_payoff_idx != len(result) - 1:
+        result[-1], result[best_payoff_idx] = result[best_payoff_idx], result[-1]
+
+    print(f"[EDITORIAL] Pinned opening: {result[0].get('emotion','?')} {result[0].get('shot_type','?')} "
+          f"({result[0].get('narrative_role','?')})  |  "
+          f"closing: {result[-1].get('emotion','?')} {result[-1].get('shot_type','?')} "
+          f"({result[-1].get('narrative_role','?')})")
+    return result
 
 
 def score_clips_with_story(
@@ -1193,7 +1304,12 @@ def score_clips_with_story(
     top_pool = list(candidate_indices)
 
     target_k = max(4, min(len(candidate_indices), desired_clip_count))
-    chosen = _mmr_select(top_pool, rel_scores, clip_vecs, target_k)
+    # Provide shot_types so MMR penalises visual repetition (-0.10 per extra duplicate).
+    _pool_shot_types = [
+        visual_meta.get(transcriptions[i].get("path", ""), {}).get("shot_type") or "unknown"
+        for i in range(len(transcriptions))
+    ]
+    chosen = _mmr_select(top_pool, rel_scores, clip_vecs, target_k, shot_types=_pool_shot_types)
 
     # Enforce narrative beat coverage first (human-editor style assembly).
     beat_cover = []
@@ -1217,12 +1333,15 @@ def score_clips_with_story(
         ordered = sorted(chosen, key=lambda i: (int(best_segment[i]), -float(rel_scores[i])))
 
     # Final editorial pass: LLM reorders shortlisted clips for narrative flow.
+    # Now passes visual metadata (shot_type, emotion, role, description) so GPT-4o
+    # can reason visually — not just by transcript text — like a real editor.
     llm_ordered = _llm_editorial_rerank(
         story=story_text,
         transcriptions=transcriptions,
         candidate_indices=ordered,
         api_key=api_key,
         tone=tone,
+        visual_meta=visual_meta,
     )
     if llm_ordered:
         ordered = llm_ordered
@@ -1239,8 +1358,8 @@ def score_clips_with_story(
         # which story beat this clip best matched.
         role = vm.get("narrative_role") or "development"
         result.append({
-            "path": path,
-            "narrative_role": role,
+            "path":            path,
+            "narrative_role":  role,
             "shot_type":       vm.get("shot_type", "unknown"),
             "emotion":         vm.get("emotion", "neutral"),
             "visual_score":    vm.get("visual_score", 0.5),
@@ -1249,6 +1368,8 @@ def score_clips_with_story(
             "best_moment_sec": vm.get("best_moment_sec"),
             "trim_start_sec":  vm.get("trim_start_sec"),
             "trim_end_sec":    vm.get("trim_end_sec"),
+            # Multi-window segments for long clips (used by generate_video expansion)
+            "segments":        vm.get("segments") or [],
         })
 
     if result:
@@ -1265,6 +1386,8 @@ def score_clips_with_story(
         result = _fix_shot_continuity(result, full_pool, max_fixes=4)
         # Second-pass LLM review: verify transitions feel natural, swap if needed
         result = _llm_continuity_check(result, story_text, api_key, tone)
+        # Human-editor invariant: best hook opens, best payoff closes
+        result = _pin_hook_and_payoff(result)
         return result
     # Final fallback: original order with default metadata
     return [

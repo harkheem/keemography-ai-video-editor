@@ -1060,6 +1060,30 @@ def generate_video(
                     _alloc_final[i] = max(FLOOR, _rem_budget * _raw_weights[i] / _free_w)
             break
 
+    # ── Rhythmic pacing modulation ───────────────────────────────────────────
+    # Apply a tone-specific repeating pattern of short/long cuts so the edit has
+    # a felt rhythm — not just statistically equal durations. After modulation we
+    # rescale so the total budget is identical to before.
+    _RHYTHM_PAT: Dict[str, List[float]] = {
+        "energetic":   [1.00, 0.80, 0.80, 1.35],  # fast-fast-fast-BREATH (every 4th)
+        "epic":        [0.80, 0.80, 1.60, 1.00],  # fast-fast-HOLD-reset (every 3rd)
+        "cinematic":   [1.00, 1.00, 1.30, 1.00],  # steady with periodic visual breath
+        "sentimental": [1.00, 1.10, 1.10, 1.50],  # gradual build towards long holds
+        "calm":        [1.15, 1.05, 1.25, 1.10],  # slow & gently varied
+    }
+    _rhy_pat = _RHYTHM_PAT.get(_tone_key, [1.0])
+    _raw_rhythm = [_rhy_pat[i % len(_rhy_pat)] for i in range(_N)]
+    _alloc_rhythmic = [_alloc_final[i] * _raw_rhythm[i] for i in range(_N)]
+    _rhythm_total = sum(_alloc_rhythmic) or 1e-9
+    _budget_pre_rhythm = sum(_alloc_final)
+    if _rhythm_total > 0 and _N > 1:
+        _rscale = _budget_pre_rhythm / _rhythm_total
+        _alloc_final = [
+            min(_ceilings[i], max(FLOOR, _alloc_rhythmic[i] * _rscale))
+            for i in range(_N)
+        ]
+    # ────────────────────────────────────────────────────────────────────────
+
     # Log allocation table
     print(f"[ALLOC] target={desired_total:.0f}s  entries={len(_expanded)}")
     for (path, _, m), alloc, avail in zip(_expanded, _alloc_final, _clip_durs):
@@ -1121,17 +1145,34 @@ def generate_video(
     # --- Adaptive transitions, metadata-driven ---
     available_transitions = list_available_transitions()
 
-    def _pick_transition(path: str) -> str:
+    # Emotional-direction → transition mapping.
+    # Escalating pairs (tension/energy rising): use kinetic transitions.
+    # Resolving pairs (releasing tension): use smooth dissolves.
+    _EMO_ESCALATE = frozenset({
+        ("calm", "tense"), ("calm", "exciting"), ("tense", "dramatic"),
+        ("neutral", "exciting"), ("happy", "inspiring"), ("neutral", "dramatic"),
+        ("calm", "dramatic"), ("neutral", "tense"), ("happy", "dramatic"),
+    })
+    _EMO_RESOLVE = frozenset({
+        ("dramatic", "calm"), ("tense", "calm"), ("exciting", "neutral"),
+        ("dramatic", "inspiring"), ("tense", "neutral"), ("sad", "inspiring"),
+        ("exciting", "calm"), ("dramatic", "happy"), ("tense", "happy"),
+    })
+
+    def _pick_transition(path: str, prev_path: str = "") -> str:
         """
-        Choose transition blending tone-level bias with per-clip visual metadata.
-        Tone defines the character of the edit; clip metadata refines individual cuts.
+        Choose transition blending:
+          1. Narrative role (hook / payoff always override)
+          2. Emotional direction between the two clips (escalate → kinetic, resolve → smooth)
+          3. Per-clip shot/emotion in context of tone
+          4. Tone's default pool
         """
         meta = _meta.get(path, {})
         shot  = (meta.get("shot_type", "") or "").lower()
         emo   = (meta.get("emotion",   "") or "").lower()
         role  = (meta.get("narrative_role", "") or "").lower()
 
-        # Narrative role overrides everything (same for all tones)
+        # 1. Narrative role overrides (same for all tones)
         if role == "hook":
             if _tone_key in ("energetic", "epic"):
                 return random.choice(["zoom_in", "slide_left", "slide_right"])
@@ -1141,19 +1182,29 @@ def generate_video(
                 return random.choice(["fadein", "crossfade"])
             return random.choice(["zoom_out", "fadein", "crossfade"])
 
-        # Clip-level emotion/shot considered in the context of tone
+        # 2. Emotion direction: how does mood change between consecutive clips?
+        if prev_path:
+            prev_emo = (_meta.get(prev_path, {}).get("emotion") or "").lower()
+            if prev_emo and emo:
+                pair = (prev_emo, emo)
+                if pair in _EMO_ESCALATE:
+                    # Tension rising → kinetic cut
+                    return random.choice(["zoom_in", "slide_up", "slide_left"])
+                if pair in _EMO_RESOLVE:
+                    # Tension releasing → smooth dissolve
+                    return random.choice(["crossfade", "fadein"])
+
+        # 3. Clip-level emotion/shot in context of tone
         if emo in ("exciting", "dramatic") or shot == "action":
-            # Even in a calm edit, action clips get something kinetic
             pool = ["slide_left", "slide_right", "zoom_in"] if _tone_key in ("calm", "sentimental") \
                    else _tone_transition_pool
             return random.choice(pool)
         if shot in ("talking_head", "close_up") or emo in ("calm", "sad", "inspiring"):
-            # In energetic edits, even dialogue clips get a slide
             pool = ["crossfade", "fadein"] if _tone_key not in ("energetic", "epic") \
                    else ["slide_left", "slide_right"]
             return random.choice(pool)
 
-        # Default: use tone's preferred pool
+        # 4. Default: tone's preferred pool
         return random.choice(_tone_transition_pool)
 
     def transition_for_pair(a, b) -> float:
@@ -1205,7 +1256,8 @@ def generate_video(
         tdur = transition_for_pair(prev, nxt)
 
         if tdur > 0 and available_transitions:
-            transition = _pick_transition(clip_paths[i] if i < len(clip_paths) else "")
+            _prev_path = clip_paths[i - 1] if (i - 1) < len(clip_paths) else ""
+            transition = _pick_transition(clip_paths[i] if i < len(clip_paths) else "", prev_path=_prev_path)
             try:
                 transitioned = apply_transition(prev, nxt, transition, tdur)
                 final_clips[-1] = apply_without_mask(apply_end(transitioned, transitioned.duration))
