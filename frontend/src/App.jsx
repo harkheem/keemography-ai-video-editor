@@ -1190,8 +1190,31 @@ export default function App() {
             {jobStatus === 'done' && jobId && (
               <>
                 <ResultPanel jobId={jobId} />
-                <div className="flex justify-center mt-4">
+                <div className="flex gap-3 mt-4">
                   <Btn
+                    primary
+                    onClick={handleGenerate}
+                    className="flex-1 py-3"
+                  >
+                    🔄  Regenerate
+                  </Btn>
+                  <Btn
+                    onClick={() => {
+                      setJobStatus(null)
+                      setJobId(null)
+                      setProgress(0)
+                      setMessage('')
+                      setClipAnalysis([])
+                      setError('')
+                      setStep(2)
+                    }}
+                    className="flex-1 py-3"
+                  >
+                    ✏️  Edit & Regenerate
+                  </Btn>
+                </div>
+                <div className="flex justify-center mt-3">
+                  <button
                     onClick={() => {
                       setStep(1)
                       setJobStatus(null)
@@ -1202,12 +1225,35 @@ export default function App() {
                       setError('')
                       setClips([])
                     }}
-                    className="text-sm px-4 py-2"
+                    className="text-xs text-[#555] hover:text-[#aaa] transition-colors cursor-pointer"
                   >
                     ↩ Start new video
-                  </Btn>
+                  </button>
                 </div>
               </>
+            )}
+
+            {/* Error recovery buttons */}
+            {jobStatus === 'error' && !isRunning && (
+              <div className="flex gap-3 mt-3">
+                <Btn primary onClick={handleGenerate} className="flex-1 py-3">
+                  🔄  Try Again
+                </Btn>
+                <Btn
+                  onClick={() => {
+                    setJobStatus(null)
+                    setJobId(null)
+                    setProgress(0)
+                    setMessage('')
+                    setClipAnalysis([])
+                    setError('')
+                    setStep(2)
+                  }}
+                  className="flex-1 py-3"
+                >
+                  ✏️  Edit & Retry
+                </Btn>
+              </div>
             )}
           </div>
         )}
