@@ -381,6 +381,7 @@ def _ffmpeg_4k_render(
             f"[{i}:v]trim=start={s:.4f}:end={e:.4f},"
             f"setpts=PTS-STARTPTS,"
             f"fps={target_fps},"
+            f"settb=1/{target_fps},"
             f"scale={out_w}:{out_h}:flags=lanczos,"
             f"format=yuv420p[v{i}]"
         )
