@@ -367,7 +367,10 @@ def _ffmpeg_4k_render(
         out_w, out_h = 3840, 2160
 
     # ── ffmpeg inputs ─────────────────────────────────────────────────────────
-    cmd = ["ffmpeg", "-y", "-hwaccel", "videotoolbox"]
+    # Software decode only — hardware decode (videotoolbox) bypasses software
+    # filter timebase normalization, causing xfade to see 1/1000000 vs 1/fps
+    # mismatches on chained transitions. Hardware encode is still used below.
+    cmd = ["ffmpeg", "-y"]
     for orig, _s, _e in segments:
         cmd += ["-i", orig]
 
@@ -402,9 +405,12 @@ def _ffmpeg_4k_render(
             out_label = f"xv{i}"
             if applied and tdur >= 0.1 and cum_dur > tdur + 0.05:
                 offset = max(0.0, cum_dur - tdur)
+                # After xfade, force timebase back to 1/fps so the next chained
+                # xfade sees matching timebases on both inputs.
                 fc += (
                     f";[{prev_label}][v{i}]xfade=transition={xftype}"
-                    f":duration={tdur:.4f}:offset={offset:.4f}[{out_label}]"
+                    f":duration={tdur:.4f}:offset={offset:.4f},"
+                    f"settb=1/{target_fps},setpts=PTS-STARTPTS[{out_label}]"
                 )
                 cum_dur += clip_durs[i] - tdur
             else:
