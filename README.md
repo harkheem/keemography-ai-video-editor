@@ -1,131 +1,179 @@
-# KEEMOGRAPHY AI Video Editor MVP
+# KEEMOGRAPHY AI Video Editor
 
-Streamlit app that turns a rough set of video clips into a story-driven short edit.
+Turn a rough set of video clips into a story-driven short edit — powered by GPT-4o vision, Whisper transcription, and embedding-based clip ranking.
 
-It uses OpenAI Whisper for transcription, embeddings for clip relevance ranking, and MoviePy for timeline rendering with transitions and optional background music.
+## Architecture
+
+```
+┌──────────────────────────────────┐
+│  React + Vite + Tailwind (SPA)   │  3-step wizard UI
+└────────────────┬─────────────────┘
+                 │ REST + SSE
+┌────────────────▼─────────────────┐
+│  FastAPI backend (uvicorn)       │  /api/* endpoints
+│  ├── backend/main.py             │  job queue, file management
+│  ├── app_utils.py                │  chunking, transcription helpers
+│  ├── scoring.py                  │  GPT-4o vision + embeddings
+│  ├── editor.py                   │  MoviePy + FFmpeg rendering
+│  └── transition.py               │  crossfade / xfade library
+└──────────────────────────────────┘
+```
+
+The FastAPI server also statically serves the built React frontend, so a single container handles everything.
+
+A legacy `app.py` Streamlit interface is still present but is not the production entrypoint.
 
 ## Features
 
-- Story-first editing: rank clips by semantic similarity to your storyline prompt.
-- Automatic transcription: transcribe uploaded/fetched clips with Whisper.
-- URL ingest: fetch direct MP4 links (Dropbox and Google Drive link normalization included).
-- Timeline rendering: stitch clips with adaptive transitions.
-- Audio options: keep original audio, replace with music, or mix (ducked music).
-- Download-ready export: generates final MP4 for preview and download in-app.
+- **Story-first editing** — rank and arrange clips by semantic similarity to your narrative prompt using OpenAI embeddings.
+- **GPT-4o visual analysis** — each clip is scored for narrative role (hook / payoff / turn / development / b-roll), shot type, emotion, and a visual score; a trim recommendation is generated from sampled frames.
+- **Whisper transcription** — clips are transcribed with automatic chunking for files over 24 MB.
+- **Beat-aligned editing** — librosa analyzes the music track for beats and transients; cuts snap to the beat grid.
+- **AI music trim** — GPT-4o suggests the best start/end window of an uploaded track.
+- **URL ingest** — paste direct MP4, Google Drive share, or Dropbox links; the backend normalizes and downloads them.
+- **Real-time progress** — SSE stream pushes stage/percentage updates to the frontend during the job.
+- **Tone presets** — Cinematic / Energetic / Sentimental / Epic / Calm adjusts pacing, clip length, and default music selection.
+- **Audio options** — keep original audio, replace with music, or mix (ducked background music).
+- **Opening title card** — optional title frame at the start of the export.
+- **Keyword filters** — boost clips matching priority keywords; drop clips matching exclusion keywords.
+- **4K support** — xfade transitions with timebase normalization for high-resolution footage.
+- **Docker / Railway ready** — single `Dockerfile` builds and serves the full stack.
 
 ## Tech Stack
 
-- Python
-- Streamlit
-- OpenAI API (`whisper-1`, `text-embedding-3-small`)
-- MoviePy + FFmpeg
-- NumPy, Pillow, Requests
+| Layer | Technology |
+|---|---|
+| Frontend | React 18, Vite, Tailwind CSS |
+| Backend | Python 3.11, FastAPI, uvicorn |
+| AI | OpenAI API — `whisper-1`, `text-embedding-3-small`, `gpt-4o` |
+| Video | MoviePy 2, FFmpeg, imageio-ffmpeg |
+| Audio | librosa, scipy, soundfile |
+| Deploy | Docker, Railway |
 
 ## Project Structure
 
-```text
+```
 ai_video_editor_mvp/
-  app.py              # Streamlit UI and end-to-end flow
-  editor.py           # Transcription + video assembly/render
-  scoring.py          # Embedding-based clip scoring
-  transition.py       # Transition library and effects
-  utils.py            # Optional helpers (scene detect, overlays, audio)
-  requirements.txt    # Python dependencies
-  packages.txt        # System packages for deployment (ffmpeg, fonts)
-  runtime.txt         # Target Python runtime for deployment
-  .env                # Local secrets (not committed)
+├── backend/
+│   ├── main.py           # FastAPI app — routes, job queue, SSE
+│   └── music/            # Default tone soundtrack assets
+├── frontend/
+│   ├── src/
+│   │   ├── App.jsx       # 3-step wizard (Clips → Settings → Generate)
+│   │   └── api.js        # Typed fetch helpers for all /api/* endpoints
+│   ├── package.json
+│   └── vite.config.js
+├── app_utils.py          # Shared helpers: chunking, transcription, path utils
+├── editor.py             # Timeline assembly and FFmpeg render pipeline
+├── scoring.py            # GPT-4o vision + embedding-based clip scoring
+├── transition.py         # Crossfade / xfade transition effects
+├── app.py                # Legacy Streamlit UI (not used in production)
+├── requirements.txt      # Python dependencies
+├── Dockerfile            # Single-container build (Python + Node + ffmpeg)
+├── .env                  # Local secrets (not committed)
+└── runtime.txt           # Python version pin
 ```
 
 ## Requirements
 
-- Python 3.11+ (deployment target is `3.11` per `runtime.txt`)
+- Python 3.11+
+- Node.js 18+ (for local frontend development)
 - FFmpeg installed and available in `PATH`
 - OpenAI API key
 
-For local macOS setup, install FFmpeg if needed:
-
 ```bash
-brew install ffmpeg
+# macOS
+brew install ffmpeg node
 ```
 
-## Setup
+## Local Development
 
-From the project folder:
+### 1. Python environment
 
 ```bash
-cd ai_video_editor_mvp
-python -m venv .venv
-source .venv/bin/activate
+python3.11 -m venv .venv311
+source .venv311/bin/activate
 pip install -r requirements.txt
 ```
 
-## Environment Variables
+### 2. Environment variables
 
-Create `.env` in `ai_video_editor_mvp/`:
+Create `.env` in the project root:
 
 ```env
-OPENAI_API_KEY=your_openai_api_key
-# or
-API_KEY=your_openai_api_key
+OPENAI_API_KEY=sk-...
+# Optional: GOOGLE_API_KEY is not required
 ```
 
-Notes:
-
-- At least one of `OPENAI_API_KEY` or `API_KEY` is required.
-- Current code path does not require `GOOGLE_API_KEY`; URL fetching works with direct downloadable links.
-
-## Run the App
+### 3. Start the backend
 
 ```bash
-cd ai_video_editor_mvp
-streamlit run app.py
+uvicorn backend.main:app --reload --port 8000
 ```
 
-Then open the local Streamlit URL shown in terminal.
+### 4. Start the frontend (dev mode with HMR)
+
+```bash
+cd frontend
+npm install
+npm run dev        # serves at http://localhost:5173, proxies /api → :8000
+```
+
+Open `http://localhost:5173`.
+
+## Production Build (Docker)
+
+```bash
+docker build -t keemography .
+docker run -p 8000:8000 -e OPENAI_API_KEY=sk-... keemography
+```
+
+Open `http://localhost:8000`. The React build is served statically by FastAPI.
+
+## Railway Deploy
+
+1. Connect the repo to a Railway project.
+2. Set `OPENAI_API_KEY` in the Railway environment variables panel.
+3. Railway detects the `Dockerfile` and builds automatically. The `$PORT` variable is injected at runtime.
 
 ## How to Use
 
-1. Enter a storyline in the `TELL YOUR STORY` panel.
-2. Add clips by upload and/or fetch direct URLs.
-3. Choose tone, transition duration, and audio options.
-4. (Optional) Add priority/exclusion keywords.
-5. Click `GENERATE` and download the resulting MP4.
+1. **Step 1 — Clips**: upload MP4 / MOV / AVI / MKV files or paste direct video URLs (Google Drive and Dropbox links are auto-converted).
+2. **Step 2 — Settings**: write your storyline prompt, choose tone, target duration, transition length, and optionally upload a music track. Expand keyword filters to prioritize or exclude specific content.
+3. **Step 3 — Generate**: review the summary and click **Generate Video**. A progress bar with stage pills (Upload → Transcribe → Analyze → Render → Done) updates in real time via SSE. When done, preview and download the MP4.
 
-## Background Music Assets (Optional but Recommended)
+## Background Music Assets
 
-If you want tone-based music, add files at:
+Default per-tone soundtracks are loaded from `backend/music/`. The render still works without them — it just skips the background music layer.
 
-```text
-assets/music/cinematic.mp3
-assets/music/energetic.mp3
-assets/music/sentimental.mp3
-assets/music/epic.mp3
-assets/music/calm.mp3
-```
+Expected filenames: `cinematic.mp3`, `energetic.mp3`, `sentimental.mp3`, `epic.mp3`, `calm.mp3`.
 
-If missing, video export still works; it just skips background music.
+## API Reference
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/upload` | Upload video clips (multipart) |
+| `POST` | `/api/upload-music` | Upload and analyze a music track |
+| `POST` | `/api/fetch-url` | Download a clip from a URL |
+| `POST` | `/api/generate` | Start a render job; returns `job_id` |
+| `GET` | `/api/status/{job_id}` | Poll job status and clip analysis |
+| `GET` | `/api/events/{job_id}` | SSE stream of progress events |
+| `GET` | `/api/download/{job_id}` | Download the finished MP4 |
+| `GET` | `/api/health` | Health check |
 
 ## Troubleshooting
 
-- `Missing API key`:
-  - Confirm `.env` contains `OPENAI_API_KEY` or `API_KEY`.
-- `No usable clips provided`:
-  - Ensure files exist, are valid videos, and are not tiny/corrupt.
-- Slow first run:
-  - `app.py`/`editor.py` can bootstrap missing packages on startup.
-- `TextClip`/font issues:
-  - The app already falls back safely if text overlay dependencies are unavailable.
-- URL fetch failures:
-  - Verify link is directly downloadable and publicly accessible.
+| Symptom | Fix |
+|---|---|
+| `Missing API key` | Set `OPENAI_API_KEY` in `.env` or the Railway secrets panel. |
+| `No usable clips` | Verify files are valid video, not zero-byte, and not corrupted. |
+| URL fetch fails | The link must be directly downloadable and publicly accessible. |
+| Slow on first run | Pip may bootstrap missing packages at startup; subsequent runs are faster. |
+| 4K xfade artifacts | Check FFmpeg version ≥ 5.0; the pipeline normalizes timebase before concat. |
 
 ## Security Notes
 
-- Never commit `.env` or secrets.
-- Rotate API keys if they are exposed.
-- Public URL downloads should only be from trusted sources.
-
-## Deployment Notes
-
-- `runtime.txt` and `packages.txt` are ready for PaaS workflows (for example, Streamlit Community Cloud-style builds).
-- Ensure environment variables are configured in your deployment secrets panel.
-
+- Never commit `.env` or API keys.
+- Uploaded files are stored in a server-side temp directory and swept after job completion.
+- URL downloads should only reference trusted, publicly accessible sources.
+- Rotate your OpenAI key if it is ever exposed.
