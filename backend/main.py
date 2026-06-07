@@ -89,7 +89,8 @@ app = FastAPI(title="Keemography API", version="2.0.0")
 # so CORS doesn't apply.  ALLOW_ALL_ORIGINS=true is a safety valve for custom
 # domains or reverse-proxy setups.
 _cors_origins: list[str] | str
-if os.getenv("ALLOW_ALL_ORIGINS", "").lower() in ("1", "true", "yes"):
+_allow_all_origins = os.getenv("ALLOW_ALL_ORIGINS", "").lower() in ("1", "true", "yes")
+if _allow_all_origins:
     _cors_origins = ["*"]
 else:
     _extra = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
@@ -105,7 +106,9 @@ else:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
-    allow_credentials=True,
+    # Wildcard origins must never be combined with credentials — that combo
+    # lets any site make authenticated cross-origin requests on a user's behalf.
+    allow_credentials=not _allow_all_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -205,6 +208,14 @@ def _is_safe_fetch_url(url: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _check_job_owner(job: dict, session_id: Optional[str]) -> bool:
+    """True if `session_id` matches the opaque per-browser token that created
+    this job. Jobs are bound to whoever started them so a leaked job_id alone
+    isn't enough to view, download, or delete someone else's job."""
+    owner = job.get("owner_session")
+    return bool(owner) and owner == session_id
 
 
 def _emit(job_id: str, progress: int, message: str) -> None:
@@ -556,6 +567,7 @@ async def start_generate(
     priority_keywords: str = Form(""),
     exclude_keywords: str = Form(""),
     api_key: Optional[str] = Form(None),
+    session_id: Optional[str] = Form(None),
 ):
     """Start a generation job; return job_id immediately."""
     try:
@@ -583,6 +595,7 @@ async def start_generate(
             "error": None,
             "events": [],
             "clip_analysis": [],
+            "owner_session": session_id,
         }
 
     params = {
@@ -611,10 +624,10 @@ async def start_generate(
 # =============================================================================
 
 @app.get("/api/status/{job_id}")
-async def get_status(job_id: str):
+async def get_status(job_id: str, session_id: Optional[str] = None):
     with _jobs_lock:
         job = _jobs.get(job_id)
-    if not job:
+    if not job or not _check_job_owner(job, session_id):
         raise HTTPException(404, "Job not found")
     return {
         "status":       job["status"],
@@ -627,8 +640,12 @@ async def get_status(job_id: str):
 
 
 @app.get("/api/events/{job_id}")
-async def job_events(job_id: str):
+async def job_events(job_id: str, session_id: Optional[str] = None):
     """Server-Sent Events stream for live progress updates."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job or not _check_job_owner(job, session_id):
+        raise HTTPException(404, "Job not found")
 
     async def _generate():
         import asyncio
@@ -674,10 +691,10 @@ async def job_events(job_id: str):
 
 
 @app.get("/api/download/{job_id}")
-async def download_result(job_id: str):
+async def download_result(job_id: str, session_id: Optional[str] = None):
     with _jobs_lock:
         job = _jobs.get(job_id)
-    if not job:
+    if not job or not _check_job_owner(job, session_id):
         raise HTTPException(404, "Job not found")
     if job["status"] != "done":
         raise HTTPException(400, f"Job not complete (status: {job['status']})")
@@ -692,12 +709,13 @@ async def download_result(job_id: str):
 
 
 @app.delete("/api/job/{job_id}")
-async def delete_job(job_id: str):
+async def delete_job(job_id: str, session_id: Optional[str] = None):
     """Clean up a job and its output file."""
     with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job or not _check_job_owner(job, session_id):
+            raise HTTPException(404, "Job not found")
         job = _jobs.pop(job_id, None)
-    if not job:
-        raise HTTPException(404, "Job not found")
     result_path = job.get("result_path")
     if result_path and os.path.exists(result_path):
         try:

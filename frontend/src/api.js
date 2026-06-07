@@ -7,6 +7,21 @@ const BASE = '/api'  // proxied in dev; same-origin in prod
 const DIRECT = import.meta.env.DEV ? 'http://localhost:8000/api' : '/api'
 
 // ---------------------------------------------------------------------------
+// Per-browser session token. Sent with every job-related request so the
+// backend can bind jobs to whoever created them — a leaked job_id alone
+// isn't enough to view/download/delete someone else's job. Persisted in
+// sessionStorage (per-tab, cleared on close); no accounts or login involved.
+// ---------------------------------------------------------------------------
+function getSessionId() {
+  let id = sessionStorage.getItem('keemo_session_id')
+  if (!id) {
+    id = crypto.randomUUID()
+    sessionStorage.setItem('keemo_session_id', id)
+  }
+  return id
+}
+
+// ---------------------------------------------------------------------------
 // Upload video clips — chunked (50 MB per chunk) to survive proxy timeouts.
 // Each chunk is sent as its own request so no single request exceeds ~10–15 s.
 // ---------------------------------------------------------------------------
@@ -131,6 +146,7 @@ export async function startGenerate(params) {
   form.append('priority_keywords', params.priorityKeywords || '')
   form.append('exclude_keywords', params.excludeKeywords || '')
   if (params.apiKey) form.append('api_key', params.apiKey)
+  form.append('session_id', getSessionId())
 
   const res = await fetch(`${BASE}/generate`, { method: 'POST', body: form })
   if (!res.ok) {
@@ -144,7 +160,7 @@ export async function startGenerate(params) {
 // Poll job status (used when SSE is unavailable)
 // ---------------------------------------------------------------------------
 export async function pollStatus(jobId) {
-  const res = await fetch(`${BASE}/status/${jobId}`)
+  const res = await fetch(`${BASE}/status/${jobId}?session_id=${getSessionId()}`)
   if (!res.ok) throw new Error(`Status check failed: ${res.statusText}`)
   return res.json() // { status, progress, message, error, has_result, clip_analysis }
 }
@@ -153,7 +169,9 @@ export async function pollStatus(jobId) {
 // SSE stream for live progress
 // ---------------------------------------------------------------------------
 export function streamEvents(jobId, onEvent, onDone, onError) {
-  const es = new EventSource(`${BASE}/events/${jobId}`)
+  // EventSource can't send custom headers, so the session token travels as a
+  // query param here (same mechanism api.js uses everywhere else for job auth).
+  const es = new EventSource(`${BASE}/events/${jobId}?session_id=${getSessionId()}`)
   let closed = false
 
   const close = () => {
@@ -189,7 +207,16 @@ export function streamEvents(jobId, onEvent, onDone, onError) {
 // Download URL
 // ---------------------------------------------------------------------------
 export function downloadUrl(jobId) {
-  return `${BASE}/download/${jobId}`
+  return `${BASE}/download/${jobId}?session_id=${getSessionId()}`
+}
+
+// ---------------------------------------------------------------------------
+// Delete a job and its output file
+// ---------------------------------------------------------------------------
+export async function deleteJob(jobId) {
+  const res = await fetch(`${BASE}/job/${jobId}?session_id=${getSessionId()}`, { method: 'DELETE' })
+  if (!res.ok) throw new Error(`Delete failed: ${res.statusText}`)
+  return res.json() // { deleted }
 }
 
 // ---------------------------------------------------------------------------
