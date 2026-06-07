@@ -4,11 +4,13 @@
 # (from the project root, with project root in PYTHONPATH)
 
 import gc
+import ipaddress
 import json
 import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -17,6 +19,7 @@ import time
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import requests
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -159,6 +162,49 @@ _sweeper_thread.start()
 
 def _get_env_key() -> Optional[str]:
     return os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY")
+
+
+def _is_within_temp_dir(path: str) -> bool:
+    """True if `path` resolves to somewhere inside the system temp dir.
+
+    All upload endpoints (/api/upload/*, /api/fetch-url) write clips and music
+    to tempfile.NamedTemporaryFile() in the system temp dir. Generation only
+    ever needs to read files the server itself created there — never arbitrary
+    client-supplied filesystem paths.
+    """
+    try:
+        real = os.path.realpath(path)
+        tmp = os.path.realpath(tempfile.gettempdir())
+        return real == tmp or real.startswith(tmp + os.sep)
+    except Exception:
+        return False
+
+
+def _is_safe_fetch_url(url: str) -> bool:
+    """Reject URLs that resolve to private / loopback / link-local / reserved
+    addresses, so /api/fetch-url can't be used to make the server probe internal
+    services or cloud metadata endpoints (SSRF guard)."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        host = parsed.hostname
+        if not host:
+            return False
+        for info in socket.getaddrinfo(host, None):
+            ip = ipaddress.ip_address(info[4][0])
+            if (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_reserved
+                or ip.is_multicast
+                or ip.is_unspecified
+            ):
+                return False
+        return True
+    except Exception:
+        return False
 
 
 def _emit(job_id: str, progress: int, message: str) -> None:
@@ -319,6 +365,8 @@ async def fetch_url(body: dict):
     if not url:
         raise HTTPException(400, "No URL provided")
     direct = normalize_drive_dropbox(url)
+    if not _is_safe_fetch_url(direct):
+        raise HTTPException(400, "URL not allowed")
     try:
         with requests.get(direct, stream=True, timeout=1200) as r:
             r.raise_for_status()
@@ -517,6 +565,10 @@ async def start_generate(
 
     if not paths:
         raise HTTPException(400, "At least one clip path is required")
+    if not all(isinstance(p, str) and _is_within_temp_dir(p) for p in paths):
+        raise HTTPException(400, "Invalid clip path")
+    if music_path and not _is_within_temp_dir(music_path):
+        raise HTTPException(400, "Invalid music path")
     if not storyline.strip():
         raise HTTPException(400, "storyline is required")
 
@@ -676,6 +728,7 @@ async def health():
 #  non-GET), which breaks POST endpoints like /api/upload/chunk.
 # =============================================================================
 _FRONTEND_DIST = os.path.join(_ROOT, "frontend", "dist")
+_FRONTEND_DIST_REAL = os.path.realpath(_FRONTEND_DIST)
 
 if os.path.isdir(_FRONTEND_DIST):
     # Serve static assets (js/css/img) for exact file matches
@@ -687,8 +740,12 @@ if os.path.isdir(_FRONTEND_DIST):
         # Never serve the SPA for /api/* — let those 404 naturally
         if full_path.startswith("api/") or full_path.startswith("api"):
             raise HTTPException(404, "Not found")
-        candidate = os.path.join(_FRONTEND_DIST, full_path)
-        if full_path and os.path.isfile(candidate):
+        # Resolve symlinks/.. and verify the result is still inside the dist
+        # directory before serving — otherwise "../../.env" style requests
+        # could read arbitrary files on the server (path traversal).
+        candidate = os.path.realpath(os.path.join(_FRONTEND_DIST, full_path))
+        is_inside = candidate == _FRONTEND_DIST_REAL or candidate.startswith(_FRONTEND_DIST_REAL + os.sep)
+        if full_path and is_inside and os.path.isfile(candidate):
             return FileResponse(candidate)
         # SPA fallback — serve index.html for all client-side routes
         return FileResponse(os.path.join(_FRONTEND_DIST, "index.html"))
