@@ -1,6 +1,7 @@
 # backend/main.py
 # FastAPI backend for Keemography AI Video Editor
-# Run with: uvicorn backend.main:app --reload --port 8000
+# Run with: cd "ai_video_editor_mvp" && ./start.sh
+
 # (from the project root, with project root in PYTHONPATH)
 
 import gc
@@ -27,6 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+
 # ── Add project root to path so editor / scoring / app_utils are importable ──
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
@@ -43,9 +45,13 @@ from editor import generate_video
 from scoring import score_clips_with_story
 
 # ── Load env ─────────────────────────────────────────────────────────────────
+# override=True: .env is the source of truth for this app's config. Without
+# it, a stray GOOGLE_API_KEY/OPENAI_API_KEY already exported in the shell
+# (old export, shell profile, previous manual test) silently wins over
+# whatever is in .env — editing .env then does nothing until you notice.
 try:
     from dotenv import load_dotenv
-    load_dotenv(os.path.join(_ROOT, ".env"))
+    load_dotenv(os.path.join(_ROOT, ".env"), override=True)
 except ImportError:
     pass
 
@@ -120,7 +126,9 @@ _jobs_lock = threading.Lock()
 
 
 def _temp_sweeper() -> None:
-    """Background thread: delete orphaned tmp video/audio files older than 2 hours.
+    """Background thread: delete orphaned tmp video/audio files older than 2 hours
+    and evict finished jobs from the in-memory store after the same window
+    (previously _jobs grew without bound for the life of the process).
 
     Runs every 30 minutes. Keeps files that are still referenced by an active job
     so that Regenerate / Edit & Regenerate can reuse uploaded clips without re-uploading.
@@ -129,6 +137,20 @@ def _temp_sweeper() -> None:
     while True:
         time.sleep(30 * 60)  # wait 30 min between sweeps
         try:
+            # Evict finished jobs older than 2 hours; their files lose
+            # protection and are removed by the file sweep below.
+            _job_cutoff = time.time() - 2 * 3600
+            with _jobs_lock:
+                _stale = [
+                    jid for jid, job in _jobs.items()
+                    if job.get("status") in ("done", "error")
+                    and job.get("ended_at", job.get("created_at", 0)) < _job_cutoff
+                ]
+                for jid in _stale:
+                    _jobs.pop(jid, None)
+            if _stale:
+                logging.info("[SWEEP] Evicted %d finished job(s)", len(_stale))
+
             # Collect all paths currently referenced by any job (running or done)
             protected: set = set()
             with _jobs_lock:
@@ -225,6 +247,55 @@ def _emit(job_id: str, progress: int, message: str) -> None:
             job["progress"] = progress
             job["message"] = message
             job["events"].append(json.dumps({"progress": progress, "message": message}))
+
+
+def _build_ab_report(scored_gemini: List[dict], scored_gpt4o: List[dict]) -> str:
+    """Markdown side-by-side of the two vision analysis paths: which clips each
+    selected, in what order, with trim windows and best-moment/emotional-peak
+    timestamps. Pure function — unit-testable without a job."""
+    def _index(scored):
+        return {os.path.basename(d.get("path", "")): (i, d) for i, d in enumerate(scored)}
+
+    a, b = _index(scored_gemini), _index(scored_gpt4o)
+    names = sorted(set(a) | set(b))
+
+    def _fmt(v, nd=1):
+        return "—" if v is None else f"{float(v):.{nd}f}"
+
+    def _side_cells(side, name):
+        if name not in side:
+            return ["dropped", "—", "—", "—", "—", "—"]
+        i, d = side[name]
+        trim = (f"{_fmt(d.get('trim_start_sec'))}–{_fmt(d.get('trim_end_sec'))}s"
+                if d.get("trim_start_sec") is not None else "—")
+        return [f"#{i + 1}", str(d.get("narrative_role", "?")), trim,
+                _fmt(d.get("best_moment_sec")), _fmt(d.get("emotional_peak_sec")),
+                f"{float(d.get('visual_score') or 0):.2f}"]
+
+    lines = [
+        "# Vision A/B report — A: Gemini video-native  |  B: GPT-4o frames",
+        "",
+        f"Clips in either edit: {len(names)}  ·  selected by A: {len(scored_gemini)}"
+        f"  ·  selected by B: {len(scored_gpt4o)}",
+        "",
+        "| clip | A order | A role | A trim | A best | A peak | A score "
+        "| B order | B role | B trim | B best | B peak | B score |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for n in names:
+        lines.append("| " + " | ".join([n] + _side_cells(a, n) + _side_cells(b, n)) + " |")
+    lines += [
+        "",
+        "## Final sequences",
+        "",
+        "**A — Gemini (used for this render):** "
+        + " → ".join(os.path.basename(d.get("path", "")) for d in scored_gemini),
+        "",
+        "**B — GPT-4o frames:** "
+        + " → ".join(os.path.basename(d.get("path", "")) for d in scored_gpt4o),
+        "",
+    ]
+    return "\n".join(lines)
 
 
 # =============================================================================
@@ -358,10 +429,16 @@ async def upload_music(request: Request):
             tmp.write(chunk)
             size += len(chunk)
         path = tmp.name
-    # AI music analysis: find the best segment matching the user's target duration
+    # AI music analysis: find the best segment matching the user's target
+    # duration. The frontend sends its current target with the upload; 45s
+    # remains the default for older clients (optional field — API compatible).
     try:
         from editor import analyze_music_for_trim
-        _target = 45.0  # default; frontend will re-suggest when user changes target
+        try:
+            _target = float(form.get("target_duration_sec") or 45.0)
+        except (TypeError, ValueError):
+            _target = 45.0
+        _target = max(5.0, min(600.0, _target))
         analysis = analyze_music_for_trim(path, target_duration_sec=_target)
     except Exception as _ae:
         logging.warning("[MUSIC] Analysis failed: %s", repr(_ae))
@@ -447,16 +524,58 @@ def _run_job(job_id: str, params: dict) -> None:
             pct = 47 + int(19 * done / max(1, total))  # 47% → 66%
             _emit(job_id, pct, f"Analyzing clip {done}/{total}: {clip_name}")
 
-        scored = score_clips_with_story(
-            transcriptions,
-            storyline,
+        _score_kwargs = dict(
             priority_keywords=priority_keywords,
             exclude_keywords=exclude_keywords,
             tone=tone,
             target_duration_sec=target_duration_sec,
             openai_api_key=api_key,
-            progress_callback=_vision_progress,
         )
+
+        # ── A/B comparison mode ───────────────────────────────────────────
+        # VISION_AB_COMPARE=1 runs the SAME job through both analysis paths
+        # (Gemini video-native and GPT-4o frames) and writes a side-by-side
+        # markdown report of selections, trim windows, and timestamps.
+        # The Gemini result drives the actual render.
+        _ab_compare = os.getenv("VISION_AB_COMPARE", "").lower() in ("1", "true", "yes")
+        if _ab_compare and not os.getenv("GOOGLE_API_KEY"):
+            logging.warning("[AB] VISION_AB_COMPARE set but GOOGLE_API_KEY missing — "
+                            "running the GPT-4o path only")
+            _ab_compare = False
+
+        if _ab_compare:
+            def _ab_progress(done: int, total: int, clip_name: str) -> None:
+                pct = 47 + int(10 * done / max(1, total))  # 47% → 57%
+                _emit(job_id, pct, f"A/B (Gemini) clip {done}/{total}: {clip_name}")
+
+            _emit(job_id, 47, "A/B: analyzing with Gemini video-native…")
+            scored = score_clips_with_story(
+                transcriptions, storyline,
+                progress_callback=_ab_progress, vision_mode="gemini", **_score_kwargs,
+            )
+            _emit(job_id, 58, "A/B: analyzing with GPT-4o frames…")
+            scored_alt = score_clips_with_story(
+                transcriptions, storyline, vision_mode="gpt4o", **_score_kwargs,
+            )
+            try:
+                _report_md = _build_ab_report(scored, scored_alt)
+                with tempfile.NamedTemporaryFile(
+                    delete=False, suffix="_ab_vision.md", mode="w"
+                ) as _rf:
+                    _rf.write(_report_md)
+                    _report_path = _rf.name
+                logging.info("[AB] Vision A/B report:\n%s", _report_md)
+                _emit(job_id, 66, f"A/B report saved: {_report_path}")
+                with _jobs_lock:
+                    if job_id in _jobs:
+                        _jobs[job_id]["ab_report_path"] = _report_path
+            except Exception as _ab_exc:
+                logging.warning("[AB] Report generation failed: %s", repr(_ab_exc))
+        else:
+            scored = score_clips_with_story(
+                transcriptions, storyline,
+                progress_callback=_vision_progress, vision_mode="auto", **_score_kwargs,
+            )
         gc.collect()
 
         clip_metadata: dict = {}
@@ -473,9 +592,12 @@ def _run_job(job_id: str, params: dict) -> None:
                         "visual_score":    item.get("visual_score", 0.5),
                         "description":     item.get("description", ""),
                         "best_moment_sec": item.get("best_moment_sec"),
+                        "emotional_peak_sec": item.get("emotional_peak_sec"),
                         "trim_start_sec":  item.get("trim_start_sec"),
                         "trim_end_sec":    item.get("trim_end_sec"),
                         "segments":        item.get("segments") or [],
+                        "arc_weight":      item.get("arc_weight"),
+                        "arc_transition":  item.get("arc_transition"),
                     }
 
         if not relevant_paths:
@@ -507,6 +629,7 @@ def _run_job(job_id: str, params: dict) -> None:
         filename = f"keemography_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
         with _jobs_lock:
             _jobs[job_id]["status"] = "done"
+            _jobs[job_id]["ended_at"] = time.time()
             _jobs[job_id]["result_path"] = final_path
             _jobs[job_id]["filename"] = filename
             # Emit visual metadata for the frontend analysis panel
@@ -525,12 +648,14 @@ def _run_job(job_id: str, params: dict) -> None:
             filename = f"keemography_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
             with _jobs_lock:
                 _jobs[job_id]["status"] = "done"
+                _jobs[job_id]["ended_at"] = time.time()
                 _jobs[job_id]["result_path"] = final_path
                 _jobs[job_id]["filename"] = filename
                 _jobs[job_id]["events"].append(json.dumps({"done": True, "status": "done"}))
         else:
             with _jobs_lock:
                 _jobs[job_id]["status"] = "error"
+                _jobs[job_id]["ended_at"] = time.time()
                 _jobs[job_id]["error"] = "Rendering failed — please try again"
                 _jobs[job_id]["events"].append(
                     json.dumps({"progress": -1, "message": "Error: rendering failed, please try again"})
@@ -542,6 +667,7 @@ def _run_job(job_id: str, params: dict) -> None:
         logging.error("[JOB %s] ERROR:\n%s", job_id, tb)
         with _jobs_lock:
             _jobs[job_id]["status"] = "error"
+            _jobs[job_id]["ended_at"] = time.time()
             _jobs[job_id]["error"] = str(e)
             _jobs[job_id]["events"].append(
                 json.dumps({"progress": -1, "message": f"Error: {e}"})
@@ -596,6 +722,11 @@ async def start_generate(
             "events": [],
             "clip_analysis": [],
             "owner_session": session_id,
+            "created_at": time.time(),
+            # Referenced by _temp_sweeper to protect input files still needed
+            # by this job from the 2-hour orphaned-temp-file cleanup.
+            "clip_paths": paths,
+            "music_path": music_path,
         }
 
     params = {

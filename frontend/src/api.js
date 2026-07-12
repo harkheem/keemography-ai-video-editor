@@ -104,12 +104,15 @@ export async function uploadClips(files, onProgress) {
 // ---------------------------------------------------------------------------
 // Upload background music
 // ---------------------------------------------------------------------------
-export async function uploadMusic(file) {
+export async function uploadMusic(file, targetDurationSec) {
   const form = new FormData()
   form.append('file', file)
+  // Lets the backend suggest a trim window matching the user's actual target
+  // (it used to always analyze for a hardcoded 45s edit).
+  if (targetDurationSec != null) form.append('target_duration_sec', String(targetDurationSec))
   const res = await fetch(`${BASE}/upload/music`, { method: 'POST', body: form })
   if (!res.ok) throw new Error(`Music upload failed: ${res.statusText}`)
-  return res.json() // { name, path, size }
+  return res.json() // { name, path, size, analysis }
 }
 
 // ---------------------------------------------------------------------------

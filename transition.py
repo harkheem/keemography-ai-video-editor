@@ -57,10 +57,15 @@ def apply_transition(clip1, clip2, transition_type: str, duration: float):
         return clip.set_position(fn)
 
     def _apply_fl(clip, func):
-        """Apply per-frame func(get_frame, local_t). local_t is clip-local time."""
+        """Apply per-frame func(get_frame, local_t). local_t is clip-local time.
+
+        MoviePy 2.x renamed Clip.fl → Clip.transform (same signature); without
+        this branch the zoom transitions silently degraded to plain fades."""
+        if hasattr(clip, "transform"):
+            return clip.transform(func)
         if hasattr(clip, "fl"):
             return clip.fl(func)
-        return clip   # best-effort: skip effect if fl unavailable
+        return clip   # best-effort: skip effect if neither API exists
 
     def _smoothstep(x: float) -> float:
         """Cubic Hermite ease-in/out."""
@@ -108,6 +113,8 @@ def apply_transition(clip1, clip2, transition_type: str, duration: float):
                 return frame
             import numpy as np
             from PIL import Image
+            if frame.dtype != np.uint8:   # PIL rejects int64 frames (e.g. ColorClip)
+                frame = np.clip(frame, 0, 255).astype(np.uint8)
             h, w = frame.shape[:2]
             nw, nh = max(2, int(w * scale)), max(2, int(h * scale))
             img = Image.fromarray(frame).resize((nw, nh), Image.LANCZOS)
@@ -133,6 +140,8 @@ def apply_transition(clip1, clip2, transition_type: str, duration: float):
                 return frame
             import numpy as np
             from PIL import Image
+            if frame.dtype != np.uint8:   # PIL rejects int64 frames (e.g. ColorClip)
+                frame = np.clip(frame, 0, 255).astype(np.uint8)
             h, w = frame.shape[:2]
             nw, nh = max(2, int(w * scale)), max(2, int(h * scale))
             img = Image.fromarray(frame).resize((nw, nh), Image.LANCZOS)

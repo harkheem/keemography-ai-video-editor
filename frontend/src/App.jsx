@@ -368,7 +368,7 @@ function fmtTime(sec) {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
 }
 
-function MusicUpload({ musicInfo, musicTrim, onSet, onTrimChange, onClear }) {
+function MusicUpload({ musicInfo, musicTrim, targetDuration, onSet, onTrimChange, onClear }) {
   const inputRef = useRef()
   const [uploading, setUploading] = useState(false)
   const [error, setError] = useState('')
@@ -382,7 +382,8 @@ function MusicUpload({ musicInfo, musicTrim, onSet, onTrimChange, onClear }) {
     setError('')
     setUploading(true)
     try {
-      const result = await uploadMusic(file)
+      // Pass the user's target so the AI trim suggestion matches their edit length
+      const result = await uploadMusic(file, targetDuration)
       onSet(result)
     } catch (e) {
       setError(e.message)
@@ -743,7 +744,7 @@ function ResultPanel({ jobId }) {
   const handleDownload = async () => {
     setDlError(null)
     try {
-      const res = await fetch(`/api/download/${jobId}`)
+      const res = await fetch(downloadUrl(jobId))
       if (!res.ok) {
         const msg = await res.text()
         throw new Error(`Download failed (${res.status}): ${msg}`)
@@ -769,7 +770,7 @@ function ResultPanel({ jobId }) {
         ✅ Video Ready
       </p>
       <video
-        src={`/api/download/${jobId}`}
+        src={downloadUrl(jobId)}
         controls
         className="w-full rounded-xl bg-black mb-4"
         style={{ maxHeight: '340px' }}
@@ -1027,6 +1028,7 @@ export default function App() {
               <MusicUpload
                 musicInfo={musicInfo}
                 musicTrim={musicTrim}
+                targetDuration={settings.targetDuration}
                 onSet={(info) => {
                   setMusicInfo(info)
                   // Pre-populate trim from AI suggestion

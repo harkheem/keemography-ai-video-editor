@@ -1,37 +1,21 @@
 # =============================
-# editor.py (FULL, CORRECTED)
+# editor.py
 # =============================
 
-# ---- bootstrap critical deps (handy on Streamlit Cloud before import) ----
-import sys, subprocess, importlib.util
-
-def ensure(spec: str, import_name: str | None = None):
-    name = import_name or spec.split("==")[0].split(">=")[0].split("[")[0]
-    if importlib.util.find_spec(name) is None:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", spec])
-
-ensure("moviepy==2.1.1", "moviepy")
-ensure("imageio-ffmpeg>=0.5.1", "imageio_ffmpeg")
-ensure("imageio>=2.34.0", "imageio")
-ensure("Pillow>=10.4.0", "PIL")
-ensure("numpy>=2.0.2", "numpy")
-ensure("librosa>=0.9.2", "librosa")
-# -------------------------------------------------------------------------
-
 import os
+import sys
+import subprocess
 import tempfile
 import random
 from typing import List, Dict, Optional, Union
-import requests
-from urllib.parse import urljoin
-from bs4 import BeautifulSoup
-from googleapiclient.discovery import build
 import re
-import concurrent.futures
 import librosa
 import numpy as np
 
 from transition import apply_transition, list_available_transitions
+
+# Project root — used to resolve bundled assets regardless of CWD
+_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def _get_api_key(explicit_key: Optional[str] = None) -> Optional[str]:
@@ -40,110 +24,11 @@ def _get_api_key(explicit_key: Optional[str] = None) -> Optional[str]:
     return os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY")
 
 
-def transcribe_videos(
-    video_paths: List[str],
-    openai_api_key: Optional[str] = None,
-) -> List[Dict[str, str]]:
-    """
-    Transcribe each video using OpenAI Whisper API (model='whisper-1').
-    Returns: list of dicts like {"path": <path>, "text": <transcript>}
-    """
-    from openai import OpenAI
-
-    api_key = _get_api_key(openai_api_key)
-    if not api_key:
-        raise RuntimeError("Missing OpenAI API key. Set API_KEY or OPENAI_API_KEY.")
-
-    client = OpenAI(api_key=api_key)
-    results: List[Dict[str, str]] = []
-
-    for path in video_paths:
-        try:
-            with open(path, "rb") as f:
-                tx = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=f,
-                )
-            text = getattr(tx, "text", "") or ""
-        except Exception as e:
-            print(f"⚠️ Transcription failed for {path}: {repr(e)}")
-            text = ""
-        results.append({"path": path, "text": text})
-
-    return results
-
-
-VIDEO_EXTENSIONS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
-
-def extract_video_links_from_page(url: str) -> list[str]:
-    """
-    Given a URL to a web page, extract all video file links (.mp4, .mov, etc.).
-    Returns a list of absolute URLs.
-    """
-    try:
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        links = set()
-        # Find <a href=...> and <video src=...> and <source src=...>
-        for tag in soup.find_all(["a", "video", "source"]):
-            src = tag.get("href") or tag.get("src")
-            if src and any(src.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
-                abs_url = urljoin(url, src)
-                links.add(abs_url)
-        return list(links)
-    except Exception as e:
-        print(f"⚠️ Failed to extract video links from {url}: {repr(e)}")
-        return []
-
-def extract_gdrive_folder_videos(folder_url: str) -> list[str]:
-    """
-    Given a Google Drive folder URL, return a list of direct download links for video files in the folder.
-    Only works for public folders/files.
-    """
-    # Extract folder ID from URL
-    m = re.search(r"/folders/([a-zA-Z0-9_-]+)", folder_url)
-    if not m:
-        print(f"⚠️ Could not extract folder ID from {folder_url}")
-        return []
-    folder_id = m.group(1)
-    try:
-        service = build("drive", "v3", developerKey=os.getenv("GOOGLE_API_KEY"))
-        # Query for video files in the folder
-        query = f"'{folder_id}' in parents and mimeType contains 'video/' and trashed = false"
-        results = service.files().list(q=query, fields="files(id, name, mimeType)", pageSize=1000).execute()
-        files = results.get("files", [])
-        links = []
-        for f in files:
-            # Only allow known video extensions
-            if any(f["name"].lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
-                # Public direct download link format
-                links.append(f"https://drive.google.com/uc?id={f['id']}&export=download")
-        return links
-    except Exception as e:
-        print(f"⚠️ Failed to extract videos from Google Drive folder: {repr(e)}")
-        return []
-
 def normalize_clip_paths(clip_paths: list[Union[str, None]]) -> list[str]:
-    """
-    Given a list of paths/URLs, expand any page URLs into their video links.
-    Returns a flat list of video file paths/URLs.
-    """
-    out = []
-    for p in clip_paths:
-        if not isinstance(p, str):
-            continue
-        # Google Drive folder support
-        if re.match(r"https?://drive\.google\.com/.*/folders/", p):
-            found = extract_gdrive_folder_videos(p)
-            out.extend(found)
-        elif p.startswith(("http://", "https://")) and not p.lower().endswith(VIDEO_EXTENSIONS):
-            # Treat as a page, try to extract video links
-            found = extract_video_links_from_page(p)
-            out.extend(found)
-        else:
-            out.append(p)
-    return out
+    """Filter to string paths. (The legacy web-page / Drive-folder scraping
+    lived here; the FastAPI backend only ever passes server-side temp paths,
+    so that code was dead — removed along with its bs4/googleapiclient deps.)"""
+    return [p for p in clip_paths if isinstance(p, str)]
 
 
 def detect_beats(audio_path: str) -> list[float]:
@@ -158,6 +43,38 @@ def detect_beats(audio_path: str) -> list[float]:
     except Exception as e:
         print(f"⚠️ Beat detection failed: {repr(e)}")
         return []
+
+
+def _music_energy_and_beats(audio_path: str):
+    """One librosa pass over the music: beat grid + smoothed energy envelope.
+
+    Returns (beat_times, envelope_times, envelope) where envelope is the
+    0-1-normalized blend of RMS (60%) and onset strength (40%), smoothed to
+    ~1s — the same "highlight" model analyze_music_for_trim uses. Both the
+    beat-snapping and the energy-adaptive pacing read from this single
+    analysis instead of loading the track twice.
+    Returns ([], None, None) on failure.
+    """
+    try:
+        from scipy.ndimage import gaussian_filter1d
+        y, sr = librosa.load(audio_path, sr=22050, mono=True)
+        tempo, beats = librosa.beat.beat_track(y=y, sr=sr, units="time")
+
+        hop = 512
+        rms = librosa.feature.rms(y=y, hop_length=hop)[0]
+        onset = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
+        n = min(len(rms), len(onset))
+        curve = (0.6 * (rms[:n] / (rms[:n].max() + 1e-9))
+                 + 0.4 * (onset[:n] / (onset[:n].max() + 1e-9)))
+        curve = gaussian_filter1d(curve, sigma=max(1, int(sr / hop)))
+        cmin, cmax = float(curve.min()), float(curve.max())
+        if cmax - cmin > 1e-6:
+            curve = (curve - cmin) / (cmax - cmin)
+        times = librosa.frames_to_time(np.arange(len(curve)), sr=sr, hop_length=hop)
+        return list(beats), times, curve
+    except Exception as e:
+        print(f"⚠️ Music analysis failed: {repr(e)}")
+        return [], None, None
 
 
 def analyze_music_for_trim(audio_path: str, target_duration_sec: float = 45.0) -> dict:
@@ -380,12 +297,16 @@ def _ffmpeg_4k_render(
     for i, (_orig, s, e) in enumerate(segments):
         d = e - s
         clip_durs.append(d)
+        # Cover-crop (scale to fill + center-crop) rather than a plain
+        # scale=W:H — sources can mix portrait/landscape and other aspect
+        # ratios, and forcing an exact W:H would stretch/distort those.
         filter_parts.append(
             f"[{i}:v]trim=start={s:.4f}:end={e:.4f},"
             f"setpts=PTS-STARTPTS,"
             f"fps={target_fps},"
             f"settb=1/{target_fps},"
-            f"scale={out_w}:{out_h}:flags=lanczos,"
+            f"scale={out_w}:{out_h}:flags=lanczos:force_original_aspect_ratio=increase,"
+            f"crop={out_w}:{out_h},setsar=1,"
             f"format=yuv420p[v{i}]"
         )
 
@@ -558,6 +479,28 @@ def generate_video(
     MIN_KEEP_SEC = 0.40
     IDEAL_TRANSITION = max(0.15, float(transition_duration)) * _tdur_mult
 
+    # ── Music analysis (single pass) ─────────────────────────────────────────
+    # Beats + energy envelope feed two downstream systems: beat-snapped cut
+    # boundaries and energy-adaptive pacing. Analyze the track exactly once.
+    _music_beats_raw: list = []
+    _energy_times = None
+    _energy_curve = None
+    if custom_music_path and os.path.exists(custom_music_path):
+        _music_beats_raw, _energy_times, _energy_curve = _music_energy_and_beats(custom_music_path)
+
+    def _energy_at_video_t(t: float) -> Optional[float]:
+        """Music energy (0-1) at video time t, honouring the music start offset
+        and looping when the track is shorter than the video."""
+        if _energy_curve is None or _energy_times is None or len(_energy_curve) == 0:
+            return None
+        track_end = float(_energy_times[-1]) or 1.0
+        mt = float(music_start_sec or 0.0) + max(0.0, float(t))
+        if mt > track_end:
+            mt = mt % track_end
+        idx = int(np.searchsorted(_energy_times, mt))
+        idx = min(max(idx, 0), len(_energy_curve) - 1)
+        return float(_energy_curve[idx])
+
     def apply_fadein(clip, duration: float):
         if not duration or duration <= 0:
             return clip
@@ -595,6 +538,23 @@ def generate_video(
         except Exception:
             pass
         return clip
+
+    def apply_cover_resize(clip, target_w: int, target_h: int):
+        """Scale + center-crop *clip* to exactly (target_w, target_h) without
+        distorting its aspect ratio (like CSS `object-fit: cover`)."""
+        if clip is None:
+            return clip
+        w, h = clip.size
+        if w == target_w and h == target_h:
+            return clip
+        scale = max(target_w / w, target_h / h)
+        new_w, new_h = max(target_w, round(w * scale)), max(target_h, round(h * scale))
+        resized = clip.resized((new_w, new_h)) if hasattr(clip, "resized") else clip.resize((new_w, new_h))
+        x1 = max(0, (new_w - target_w) // 2)
+        y1 = max(0, (new_h - target_h) // 2)
+        if hasattr(resized, "cropped"):
+            return resized.cropped(x1=x1, y1=y1, width=target_w, height=target_h)
+        return resized.crop(x1=x1, y1=y1, width=target_w, height=target_h)
 
     def apply_audio_volume(audio_clip, vol: float):
         if audio_clip is None:
@@ -691,7 +651,9 @@ def generate_video(
         # Clamp allocation to what the clip actually has
         target = min(duration, max(1.5, float(alloc_sec)))
 
-        if duration <= target + 0.35:
+        # Keep the whole clip only when the allocation IS the whole clip —
+        # the old +0.35s slop leaked up to 0.35s per clip past the budget.
+        if duration <= target + 0.05:
             _trim_log[idx] = (0.0, duration)
             return clip
 
@@ -918,6 +880,32 @@ def generate_video(
         else:
             _raws.append(raw)
 
+    # ── Orientation / resolution normalization ───────────────────────────────
+    # Uploaded clips routinely mix portrait phone footage with landscape
+    # footage, and low-res clips with high-res ones. Without a common canvas,
+    # concatenate_videoclips falls back to "compose" mode: every mismatched
+    # clip gets letterboxed onto a canvas sized to the largest clip, so the
+    # edit visibly jumps between full-frame and pillarboxed/letterboxed shots.
+    # Normalize every clip up front to one shared canvas — chosen from the
+    # majority orientation among the clips actually in this edit — using a
+    # cover-crop (scale to fill + center-crop) so nothing is stretched.
+    _sized = [r.size for r in _raws if r is not None]
+    if _sized:
+        _landscape = [s for s in _sized if s[0] >= s[1]]
+        _portrait = [s for s in _sized if s[0] < s[1]]
+        _majority = _landscape if len(_landscape) >= len(_portrait) else _portrait
+        _best_w, _best_h = max(_majority, key=lambda s: s[0] * s[1])
+        _scale_cap = min(1.0, 1920 / max(_best_w, _best_h))
+        _canvas_w = max(2, int(round(_best_w * _scale_cap / 2) * 2))
+        _canvas_h = max(2, int(round(_best_h * _scale_cap / 2) * 2))
+        if any(r is not None and tuple(r.size) != (_canvas_w, _canvas_h) for r in _raws):
+            print(f"[CANVAS] Normalizing clips to {_canvas_w}x{_canvas_h} "
+                  f"(mixed orientation/resolution detected across uploads)")
+            _raws = [
+                apply_cover_resize(r, _canvas_w, _canvas_h) if r is not None else None
+                for r in _raws
+            ]
+
     # ── Weighted screen-time allocation ─────────────────────────────────────
     # Each clip earns screen time in proportion to how much it deserves,
     # based on GPT-4o metadata — not equal fair share.
@@ -946,7 +934,7 @@ def generate_video(
         "neutral":   0.80,
     }
 
-    desired_total = float(target_duration_sec) if target_duration_sec else 34.0
+    desired_total = float(target_duration_sec) if target_duration_sec else 45.0
     _valid_pairs = [(p, r) for p, r in zip(clip_paths, _raws) if r is not None]
 
     # ── Multi-segment expansion ──────────────────────────────────────────────
@@ -964,7 +952,7 @@ def generate_video(
         segments = base_m.get("segments") or []
         if len(segments) >= 2:
             print(f"[SEGMENTS] {os.path.basename(path)} → {len(segments)} windows")
-            for seg in segments:
+            for _seg_i, seg in enumerate(segments):
                 s_start = seg.get("start_sec")
                 s_end   = seg.get("end_sec")
                 if s_start is None or s_end is None:
@@ -979,6 +967,13 @@ def generate_video(
                     "visual_score":    float(seg.get("visual_score", base_m.get("visual_score", 0.5))),
                     "description":     seg.get("description",    base_m.get("description",    "")),
                     "segments":        [],  # don't recurse
+                    # arc_transition was chosen for the cut from the PRECEDING
+                    # TRANSCRIPT-level clip into this one — only the first
+                    # segment's incoming cut is that transition. Later segments'
+                    # incoming cut is between two segments of the SAME source
+                    # clip, which the arc pass never reasoned about, so let the
+                    # heuristic picker handle those instead.
+                    "arc_transition":  base_m.get("arc_transition") if _seg_i == 0 else None,
                 }
                 _expanded.append((path, raw, seg_meta))
         else:
@@ -991,6 +986,17 @@ def generate_video(
     # Raw unnormalized weight per segment entry
     _raw_weights: list[float] = []
     for path, raw, m in _expanded:
+        # The scoring arc pass (GPT-4o, sees every clip + the storyline
+        # together) can assign its own screen_time_weight per clip — its
+        # editorial judgment of what THIS clip deserves in THIS edit, rather
+        # than a fixed per-role/emotion table. Use it when present; otherwise
+        # fall back to the heuristic formula below (arc pass didn't run, e.g.
+        # no OpenAI key).
+        _arc_w = m.get("arc_weight")
+        if _arc_w is not None:
+            _raw_weights.append(max(0.01, float(_arc_w)))
+            continue
+
         role = (m.get("narrative_role") or "development").lower()
         emo  = (m.get("emotion")        or "neutral").lower()
         vs   = float(m.get("visual_score") or 0.5)
@@ -1020,57 +1026,133 @@ def generate_video(
     _clip_durs = [_entry_avail(r, m) for _, r, m in _expanded]
     _N = len(_expanded)
     FLOOR = 1.5
+
+    # ── Drop overflow entries ────────────────────────────────────────────────
+    # The editor is the final authority on clip count: if even at the per-clip
+    # FLOOR the entries can't fit the target (scoring over-selected, or
+    # continuity repair inserted extras), drop the lowest-weight entries until
+    # the budget is feasible. The 5% grace absorbs transition overlap headroom.
+    while _N > 1 and _N * FLOOR > desired_total * 1.05:
+        _drop = min(range(_N), key=lambda i: _raw_weights[i])
+        print(f"[ALLOC] Budget overflow — dropping lowest-weight entry "
+              f"{os.path.basename(_expanded[_drop][0])} (w={_raw_weights[_drop]:.2f})")
+        for _lst in (_expanded, _raw_weights, _clip_durs):
+            _lst.pop(_drop)
+        _N -= 1
+
     # CEIL_RATIO must be >= 1/N so that N clips can collectively fill 100% of the
     # budget. With 2 clips, 0.45*2=0.90 — always 10% short. Use max(0.45, 1/N).
     CEIL_RATIO = max(0.45, 1.0 / max(1, _N))
 
     # Tone-modulated per-clip ceiling: _trim_mult controls how long individual shots
     # can run — energetic (0.65) = shorter shots/more cuts, calm (1.35) = longer shots.
-    # Floor at 50% of equal share so budget holes don't force excessive freeze-frame padding.
+    # Floor at 50% of equal share so budget holes don't force short outputs.
     _tone_ceil = max(
         (desired_total / max(1, _N)) * _trim_mult,
         (desired_total / max(1, _N)) * 0.50,
     )
 
-    # Per-clip hard ceiling: actual footage OR monopoly cap OR tone cap, whichever is smallest.
-    _ceilings = [max(FLOOR, min(_clip_durs[i], desired_total * CEIL_RATIO, _tone_ceil))
-                 for i in range(_N)]
+    # ── Ceiling relaxation stages ────────────────────────────────────────────
+    # Preferred pacing first; when the footage can't fill the budget under a
+    # stage's caps, relax to the next stage. Hitting the requested duration
+    # beats preserving tone pacing; only genuine footage shortage loses.
+    #   stage 0: footage ∧ monopoly cap ∧ tone cap
+    #   stage 1: footage ∧ monopoly cap ∧ tone cap scaled up just enough
+    #   stage 2: footage ∧ monopoly cap
+    #   stage 3: footage only
+    def _ceilings_for(stage: int, budget: float) -> list:
+        if stage == 0:
+            caps = [min(_clip_durs[i], desired_total * CEIL_RATIO, _tone_ceil) for i in range(_N)]
+        elif stage == 1:
+            # Proportional relaxation: grow the tone cap by exactly the deficit
+            # ratio so pacing character survives small budget shortfalls.
+            base = [min(_clip_durs[i], desired_total * CEIL_RATIO, _tone_ceil) for i in range(_N)]
+            ratio = (budget / max(sum(max(FLOOR, c) for c in base), 1e-6)) * 1.05
+            caps = [min(_clip_durs[i], desired_total * CEIL_RATIO, _tone_ceil * max(1.0, ratio))
+                    for i in range(_N)]
+        elif stage == 2:
+            caps = [min(_clip_durs[i], desired_total * CEIL_RATIO) for i in range(_N)]
+        else:
+            caps = [_clip_durs[i] for i in range(_N)]
+        return [max(FLOOR, c) for c in caps]
 
-    # ── Iterative saturation allocation ─────────────────────────────────────
-    # Single-pass normalization is broken: rescaling after clamping pushes
-    # ceiling-capped clips above their ceiling, then apply_smart_trim silently
-    # clips them back, leaking budget. Instead we iterate:
-    #   1. Distribute budget proportionally to unsaturated clips.
-    #   2. Any clip whose tentative alloc >= ceiling is pinned to that ceiling.
-    #   3. Its budget surplus is freed for the remaining unsaturated clips.
-    #   4. Repeat until no new pins → assign remainder proportionally.
-    _alloc_final = [0.0] * _N
-    _saturated   = [False] * _N
-    _rem_budget  = desired_total
+    def _waterfill(budget: float, ceilings: list) -> list:
+        """Distribute `budget` across entries proportional to weight, each
+        allocation clamped to [FLOOR, ceiling_i], with total equal to
+        min(budget, sum(ceilings)) exactly — no leak in either direction."""
+        alloc = [0.0] * _N
+        fixed = [False] * _N
+        rem = budget
+        for _ in range(_N + 2):
+            free = [i for i in range(_N) if not fixed[i]]
+            if not free:
+                break
+            wsum = sum(_raw_weights[i] for i in free) or 1e-9
+            pinned = False
+            for i in free:
+                t = rem * _raw_weights[i] / wsum
+                if t >= ceilings[i] - 1e-6:
+                    alloc[i], fixed[i] = ceilings[i], True
+                    rem -= ceilings[i]
+                    pinned = True
+                elif t <= FLOOR + 1e-6:
+                    alloc[i], fixed[i] = FLOOR, True
+                    rem -= FLOOR
+                    pinned = True
+            if not pinned:
+                # Every remaining share is strictly inside (FLOOR, ceiling) —
+                # assign proportionally; total is exact by construction.
+                wsum = sum(_raw_weights[i] for i in free) or 1e-9
+                for i in free:
+                    alloc[i] = rem * _raw_weights[i] / wsum
+                break
+        return alloc
 
-    for _iter in range(_N + 2):
-        _free_w = sum(_raw_weights[i] for i in range(_N) if not _saturated[i]) or 1e-9
-        _any_new = False
-        for i in range(_N):
-            if not _saturated[i]:
-                _tentative = _rem_budget * _raw_weights[i] / _free_w
-                if _tentative >= _ceilings[i] - 0.01:
-                    _alloc_final[i] = _ceilings[i]
-                    _saturated[i]   = True
-                    _rem_budget    -= _ceilings[i]
-                    _any_new        = True
-        if not _any_new:
-            # No further saturation — assign remaining budget proportionally
-            _free_w = sum(_raw_weights[i] for i in range(_N) if not _saturated[i]) or 1e-9
-            for i in range(_N):
-                if not _saturated[i]:
-                    _alloc_final[i] = max(FLOOR, _rem_budget * _raw_weights[i] / _free_w)
+    # ── Fixed-point allocation: budget = target + expected transition overlap ─
+    # Applied transitions overlap the incoming clip's head, consuming ~tdur of
+    # timeline per cut, so clips must collectively be allocated target + Σtdur.
+    # tdur depends on the allocations themselves (20% cap on short clips), so
+    # iterate to a fixed point — converges in 2-3 passes.
+    def _expected_overlap(allocs: list) -> float:
+        total = 0.0
+        prev_d = allocs[0] if allocs else 0.0
+        for i in range(1, len(allocs)):
+            safe = min(IDEAL_TRANSITION, 0.20 * min(prev_d, allocs[i]))
+            tdur = safe if safe >= 0.12 else 0.0
+            total += tdur
+            prev_d = allocs[i] - tdur
+        return total
+
+    _overlap_est = 0.0
+    _alloc_final = [FLOOR] * _N
+    _ceilings = _ceilings_for(3, desired_total)
+    for _fp in range(4):
+        _budget = max(desired_total + _overlap_est, _N * FLOOR)
+        for _stage in range(4):
+            _ceilings = _ceilings_for(_stage, _budget)
+            if sum(_ceilings) >= _budget - 0.01 or _stage == 3:
+                break
+        _alloc_final = _waterfill(_budget, _ceilings)
+        _new_est = _expected_overlap(_alloc_final)
+        if abs(_new_est - _overlap_est) < 0.05:
             break
+        _overlap_est = _new_est
 
-    # ── Rhythmic pacing modulation ───────────────────────────────────────────
-    # Apply a tone-specific repeating pattern of short/long cuts so the edit has
-    # a felt rhythm — not just statistically equal durations. After modulation we
-    # rescale so the total budget is identical to before.
+    # Footage-limited: deliver a shorter edit and warn — never freeze-pad.
+    _planned_total = sum(_alloc_final)
+    if _planned_total < desired_total + _overlap_est - 0.5:
+        print(f"[DUR] ⚠️ Only {_planned_total:.1f}s of usable footage for a "
+              f"{desired_total:.0f}s target — output will be "
+              f"~{max(0.0, _planned_total - _overlap_est):.0f}s "
+              f"(delivering shorter instead of padding)")
+
+    # ── Pacing modulation (zero-sum) ─────────────────────────────────────────
+    # With music: shot length follows the track's energy envelope — short cuts
+    # through high-energy passages, longer holds in lulls — so pacing is felt
+    # against the soundtrack, not a fixed positional pattern.
+    # Without music: fall back to the tone-specific rhythm pattern.
+    # Either way the modulation residual is redistributed among entries that
+    # still have head-room so the planned total is EXACTLY preserved.
     _RHYTHM_PAT: Dict[str, List[float]] = {
         "energetic":   [1.00, 0.80, 0.80, 1.35],  # fast-fast-fast-BREATH (every 4th)
         "epic":        [0.80, 0.80, 1.60, 1.00],  # fast-fast-HOLD-reset (every 3rd)
@@ -1079,16 +1161,42 @@ def generate_video(
         "calm":        [1.15, 1.05, 1.25, 1.10],  # slow & gently varied
     }
     _rhy_pat = _RHYTHM_PAT.get(_tone_key, [1.0])
-    _raw_rhythm = [_rhy_pat[i % len(_rhy_pat)] for i in range(_N)]
-    _alloc_rhythmic = [_alloc_final[i] * _raw_rhythm[i] for i in range(_N)]
-    _rhythm_total = sum(_alloc_rhythmic) or 1e-9
-    _budget_pre_rhythm = sum(_alloc_final)
-    if _rhythm_total > 0 and _N > 1:
-        _rscale = _budget_pre_rhythm / _rhythm_total
-        _alloc_final = [
-            min(_ceilings[i], max(FLOOR, _alloc_rhythmic[i] * _rscale))
+    if _N > 1:
+        _pre_total = sum(_alloc_final)
+        _mults: List[float] = []
+        if _energy_curve is not None:
+            _cum = 0.0
+            for i in range(_N):
+                _center = _cum + _alloc_final[i] / 2.0
+                _e = _energy_at_video_t(_center)
+                # energy 0 → 1.35× hold, energy 1 → 0.73× quick cut
+                _mults.append(1.0 if _e is None else (1.35 - 0.62 * _e))
+                _cum += _alloc_final[i]
+            print(f"[PACING] Music-energy pacing active "
+                  f"(mult {min(_mults):.2f}–{max(_mults):.2f})")
+        else:
+            _mults = [_rhy_pat[i % len(_rhy_pat)] for i in range(_N)]
+        _mod = [
+            min(_ceilings[i], max(FLOOR, _alloc_final[i] * _mults[i]))
             for i in range(_N)
         ]
+        _residual = _pre_total - sum(_mod)
+        for _pass in range(3):
+            if abs(_residual) < 0.01:
+                break
+            room = [
+                (_ceilings[i] - _mod[i]) if _residual > 0 else (_mod[i] - FLOOR)
+                for i in range(_N)
+            ]
+            total_room = sum(r for r in room if r > 0)
+            if total_room <= 1e-6:
+                break
+            for i in range(_N):
+                if room[i] > 0:
+                    share = _residual * (room[i] / total_room)
+                    _mod[i] = min(_ceilings[i], max(FLOOR, _mod[i] + share))
+            _residual = _pre_total - sum(_mod)
+        _alloc_final = _mod
     # ────────────────────────────────────────────────────────────────────────
 
     # Log allocation table
@@ -1106,12 +1214,17 @@ def generate_video(
     alloc_iter = iter(_alloc_final)
     for i, (path, raw, m) in enumerate(_expanded):
         alloc = next(alloc_iter)
+        # Anchor priority: explicit best moment, else the grounded emotional
+        # peak (laughter/tears/cheer timestamp from the video-native model).
+        _bm_anchor = m.get("best_moment_sec")
+        if _bm_anchor is None:
+            _bm_anchor = m.get("emotional_peak_sec")
         trimmed = apply_smart_trim(
             raw, i, len(_expanded),
             alloc_sec         = alloc,
             vision_trim_start = m.get("trim_start_sec"),
             vision_trim_end   = m.get("trim_end_sec"),
-            best_moment_sec   = m.get("best_moment_sec"),
+            best_moment_sec   = _bm_anchor,
             story_weight      = _story_weight(path),
         )
         # Defer closing raw — the entire lazy MoviePy pipeline chains back to
@@ -1141,13 +1254,21 @@ def generate_video(
             "Top load failures:\n" + preview
         )
 
-    # --- Beat-aligned editing if user music provided ---
+    # --- Beat grid (in video-timeline coordinates) if user music provided ---
+    # Music playback at video time t plays music sample (music_start_sec + t),
+    # so a beat at music time b lands on screen at video time b - music_start_sec.
+    # Beats come from the single up-front music analysis; detect_beats is only
+    # a fallback if that failed.
     beat_times = []
     if custom_music_path and os.path.exists(custom_music_path):
-        beat_times = detect_beats(custom_music_path)
-        # Only use beats within the total video duration
+        _raw_beats = _music_beats_raw or detect_beats(custom_music_path)
+        _music_offset = float(music_start_sec or 0.0)
         total_clip_duration = sum(c.duration for c in clips)
-        beat_times = [b for b in beat_times if b < total_clip_duration]
+        beat_times = [
+            b - _music_offset
+            for b in _raw_beats
+            if b >= _music_offset and (b - _music_offset) < total_clip_duration
+        ]
 
     # --- Adaptive transitions, metadata-driven ---
     available_transitions = list_available_transitions()
@@ -1166,15 +1287,43 @@ def generate_video(
         ("exciting", "calm"), ("dramatic", "happy"), ("tense", "happy"),
     })
 
-    def _pick_transition(path: str, prev_path: str = "") -> str:
+    # Tracks the last transition actually used so back-to-back cuts don't
+    # repeat the same effect twice in a row purely by chance.
+    _last_transition_used = [None]
+
+    def _choice_avoid_repeat(pool: list) -> str:
+        candidates = list(pool)
+        if len(candidates) > 1 and _last_transition_used[0] in candidates:
+            without_repeat = [c for c in candidates if c != _last_transition_used[0]]
+            if without_repeat:
+                candidates = without_repeat
+        pick = random.choice(candidates)
+        _last_transition_used[0] = pick
+        return pick
+
+    def _pick_transition(meta: dict, prev_meta: Optional[dict] = None) -> str:
         """
         Choose transition blending:
+          0. The scoring arc pass's own transition choice for this cut, if it ran
           1. Narrative role (hook / payoff always override)
           2. Emotional direction between the two clips (escalate → kinetic, resolve → smooth)
           3. Per-clip shot/emotion in context of tone
           4. Tone's default pool
+
+        Takes the per-timeline-entry metadata dicts directly (not a path lookup
+        into the global _meta) so multi-segment clips — where two entries share
+        the same source path but carry different per-segment shot/emotion/role —
+        get the correct metadata for the segment actually at this position.
         """
-        meta = _meta.get(path, {})
+        meta = meta or {}
+        # 0. Arc pass already reasoned about the emotional/energy change between
+        # this clip and its predecessor (in its own proposed order) — trust it
+        # over the heuristic cascade below when it made a call for this cut.
+        arc_t = meta.get("arc_transition")
+        if arc_t and arc_t in available_transitions:
+            _last_transition_used[0] = arc_t
+            return arc_t
+
         shot  = (meta.get("shot_type", "") or "").lower()
         emo   = (meta.get("emotion",   "") or "").lower()
         role  = (meta.get("narrative_role", "") or "").lower()
@@ -1182,37 +1331,37 @@ def generate_video(
         # 1. Narrative role overrides (same for all tones)
         if role == "hook":
             if _tone_key in ("energetic", "epic"):
-                return random.choice(["zoom_in", "slide_left", "slide_right"])
-            return random.choice(["zoom_in", "crossfade"])
+                return _choice_avoid_repeat(["zoom_in", "slide_left", "slide_right"])
+            return _choice_avoid_repeat(["zoom_in", "crossfade"])
         if role == "payoff":
             if _tone_key in ("sentimental", "calm"):
-                return random.choice(["fadein", "crossfade"])
-            return random.choice(["zoom_out", "fadein", "crossfade"])
+                return _choice_avoid_repeat(["fadein", "crossfade"])
+            return _choice_avoid_repeat(["zoom_out", "fadein", "crossfade"])
 
         # 2. Emotion direction: how does mood change between consecutive clips?
-        if prev_path:
-            prev_emo = (_meta.get(prev_path, {}).get("emotion") or "").lower()
+        if prev_meta:
+            prev_emo = (prev_meta.get("emotion") or "").lower()
             if prev_emo and emo:
                 pair = (prev_emo, emo)
                 if pair in _EMO_ESCALATE:
                     # Tension rising → kinetic cut
-                    return random.choice(["zoom_in", "slide_up", "slide_left"])
+                    return _choice_avoid_repeat(["zoom_in", "slide_up", "slide_left"])
                 if pair in _EMO_RESOLVE:
                     # Tension releasing → smooth dissolve
-                    return random.choice(["crossfade", "fadein"])
+                    return _choice_avoid_repeat(["crossfade", "fadein"])
 
         # 3. Clip-level emotion/shot in context of tone
         if emo in ("exciting", "dramatic") or shot == "action":
             pool = ["slide_left", "slide_right", "zoom_in"] if _tone_key in ("calm", "sentimental") \
                    else _tone_transition_pool
-            return random.choice(pool)
+            return _choice_avoid_repeat(pool)
         if shot in ("talking_head", "close_up") or emo in ("calm", "sad", "inspiring"):
             pool = ["crossfade", "fadein"] if _tone_key not in ("energetic", "epic") \
                    else ["slide_left", "slide_right"]
-            return random.choice(pool)
+            return _choice_avoid_repeat(pool)
 
         # 4. Default: tone's preferred pool
-        return random.choice(_tone_transition_pool)
+        return _choice_avoid_repeat(_tone_transition_pool)
 
     def transition_for_pair(a, b) -> float:
         # At most 20% of the shorter clip
@@ -1220,35 +1369,104 @@ def generate_video(
         safe = min(IDEAL_TRANSITION, max_allowed)
         return safe if safe >= 0.12 else 0.0
 
-    # If we have enough beats, align cuts to them
-    cut_points = []
-    if beat_times and len(beat_times) >= len(clips):
-        # Use beat times as cut points for each clip
-        cut_points = beat_times[:len(clips)]
+    # ── Planned transition overlaps ──────────────────────────────────────────
+    # Per-pair transition durations computed from the ACTUAL trimmed clip
+    # lengths, exactly as the assembly loop will apply them. Each applied
+    # transition overlaps the incoming clip's head, consuming tdur of timeline,
+    # so expected runtime = Σclip_durations − Σtdur.
+    def _plan_tdurs() -> list:
+        tdurs = []
+        prev_d = float(clips[0].duration) if clips else 0.0
+        for _pi in range(1, len(clips)):
+            d_i = float(clips[_pi].duration)
+            safe = min(IDEAL_TRANSITION, 0.20 * min(prev_d, d_i))
+            tdur = safe if safe >= 0.12 else 0.0
+            tdurs.append(tdur)
+            prev_d = d_i - tdur
+        return tdurs
 
-        # Gate: skip clip trimming when music is faster than 1 beat/sec on average.
-        # At 120 BPM beats are ~0.5s apart — trimming clips to that destroys content.
-        # cut_points is still populated above so it remains available for future sync features.
-        _avg_beat_interval = (
-            (beat_times[-1] - beat_times[0]) / max(1, len(beat_times) - 1)
-            if len(beat_times) >= 2 else 0.0
-        )
-        if _avg_beat_interval >= 1.0:
-            for i, c in enumerate(clips):
-                if i < len(cut_points) - 1:
-                    beat_len = cut_points[i + 1] - cut_points[i]
-                    # Floor: never trim below what the allocation engine computed.
-                    # _alloc_final is indexed 1:1 with clips (both built from _expanded).
-                    effective_beat_len = max(beat_len, _alloc_final[i])
-                    if effective_beat_len > 0 and c.duration > effective_beat_len:
-                        clips[i] = apply_subclip(c, 0, effective_beat_len)
-                        # Update trim log: keep the chosen start, shorten the window
-                        if i in _trim_log:
-                            _s0, _ = _trim_log[i]
-                            _trim_log[i] = (_s0, _s0 + effective_beat_len)
+    def _recut(idx: int, new_start: float, new_end: float) -> None:
+        """Re-cut clips[idx] from its raw source and keep _trim_log in sync."""
+        raw_i = _expanded[idx][1]
+        # Whole-clip entries were never registered for deferred close (trimmed
+        # is raw); once replaced by a subclip, the raw must be closed later.
+        if id(raw_i) not in _closed_raw_ids:
+            _closed_raw_ids.add(id(raw_i))
+            _deferred_close.append(raw_i)
+        clips[idx] = apply_without_mask(apply_subclip(raw_i, new_start, new_end))
+        _trim_log[idx] = (new_start, new_end)
 
-    # Safe to close raw clips now — beat alignment (the last reader-dependent
-    # operation on trimmed subclips) is complete.
+    # ── Beat-aligned cut boundaries (zero-sum) ───────────────────────────────
+    # Snap each cut to the nearest music beat by shifting the boundary between
+    # a clip pair: clip k's out-point moves by +delta, clip k+1's out-point by
+    # −delta. Total runtime is EXACTLY unchanged and later cuts don't move.
+    if beat_times and len(beat_times) >= 2 and len(clips) >= 2:
+        _intervals = [b2 - b1 for b1, b2 in zip(beat_times, beat_times[1:])]
+        _med_interval = sorted(_intervals)[len(_intervals) // 2]
+        _max_shift = min(0.45 * _med_interval, 0.8)
+        _tdurs_beat = _plan_tdurs()
+        _cursor = 0.0
+        for k in range(len(clips) - 1):
+            _cursor += float(clips[k].duration) - (_tdurs_beat[k] if k < len(_tdurs_beat) else 0.0)
+            _nearest = min(beat_times, key=lambda b: abs(b - _cursor))
+            delta = _nearest - _cursor
+            if abs(delta) < 0.02 or abs(delta) > _max_shift:
+                continue
+            s_k, e_k = _trim_log.get(k, (0.0, float(clips[k].duration)))
+            s_n, e_n = _trim_log.get(k + 1, (0.0, float(clips[k + 1].duration)))
+            src_k = float(getattr(_expanded[k][1], "duration", 0.0) or 0.0)
+            src_n = float(getattr(_expanded[k + 1][1], "duration", 0.0) or 0.0)
+            new_e_k = e_k + delta
+            new_e_n = e_n - delta
+            # Guards: stay inside source footage, keep both clips >= FLOOR
+            if not (s_k + FLOOR <= new_e_k <= src_k):
+                continue
+            if new_e_n - s_n < FLOOR or new_e_n > src_n:
+                continue
+            _recut(k, s_k, new_e_k)
+            _recut(k + 1, s_n, new_e_n)
+            _cursor += delta  # boundary k now sits on the beat
+            print(f"[BEAT] Cut {k + 1} snapped {delta:+.2f}s to beat @ {_nearest:.2f}s")
+
+    # ── Residual correction: land on target BEFORE rendering ────────────────
+    # Analytic expected runtime = Σclip_durations − Σplanned_tdurs. Any drift
+    # from ceilings/floors/beat clamps is repaired by nudging clip out-points:
+    # extend into unused source tail when short, shave the roomiest clips when
+    # long. Iterated because tdur caps shift slightly as durations change.
+    if target_duration_sec and clips:
+        for _rc_pass in range(3):
+            _tdurs_plan = _plan_tdurs()
+            _expected = sum(float(c.duration) for c in clips) - sum(_tdurs_plan)
+            _residual = float(desired_total) - _expected
+            if abs(_residual) <= 0.15:
+                break
+            _adjs = []
+            for _ri, c in enumerate(clips):
+                s_i, e_i = _trim_log.get(_ri, (0.0, float(c.duration)))
+                src_d = float(getattr(_expanded[_ri][1], "duration", 0.0) or 0.0)
+                if _residual > 0:
+                    room = max(0.0, src_d - e_i)          # unused source tail
+                else:
+                    room = max(0.0, (e_i - s_i) - FLOOR)  # trimmable excess
+                _adjs.append(room)
+            _total_room = sum(_adjs)
+            if _total_room <= 1e-6:
+                if _residual > 0.5:
+                    print(f"[DUR] ⚠️ No footage left to extend — output will be "
+                          f"~{_expected:.1f}s of a {desired_total:.0f}s target")
+                break
+            _needed = min(abs(_residual), _total_room)
+            for _ri, room in enumerate(_adjs):
+                if room <= 0:
+                    continue
+                share = _needed * (room / _total_room)
+                s_i, e_i = _trim_log.get(_ri, (0.0, float(clips[_ri].duration)))
+                new_e = e_i + share if _residual > 0 else e_i - share
+                _recut(_ri, s_i, new_e)
+        _tdurs_plan = _plan_tdurs()
+    else:
+        _tdurs_plan = _plan_tdurs()
+
     # NOTE: _deferred_close raws are kept alive through the entire lazy pipeline
     # (beat align → fades → transitions → concat → write). Closed in finally below.
 
@@ -1260,24 +1478,42 @@ def generate_video(
     for i in range(1, len(clips)):
         prev = final_clips[-1]
         nxt = clips[i]
-        tdur = transition_for_pair(prev, nxt)
+        # Use the PLANNED transition duration (same values the duration budget
+        # accounted for) so runtime stays deterministic.
+        tdur = _tdurs_plan[i - 1] if (i - 1) < len(_tdurs_plan) else transition_for_pair(prev, nxt)
 
         if tdur > 0 and available_transitions:
-            _prev_path = clip_paths[i - 1] if (i - 1) < len(clip_paths) else ""
-            transition = _pick_transition(clip_paths[i] if i < len(clip_paths) else "", prev_path=_prev_path)
+            # Index metadata via _expanded, not clip_paths — after multi-segment
+            # expansion (and overflow drops) clip_paths no longer lines up 1:1
+            # with the timeline entries. Pass the per-entry meta dicts directly
+            # so multi-segment clips (same path, different segment meta) resolve
+            # to the segment actually at this timeline position.
+            _prev_meta = _expanded[i - 1][2] if (i - 1) < len(_expanded) else None
+            _nxt_meta = _expanded[i][2] if i < len(_expanded) else {}
+            transition = _pick_transition(_nxt_meta, prev_meta=_prev_meta)
             try:
                 transitioned = apply_transition(prev, nxt, transition, tdur)
                 final_clips[-1] = apply_without_mask(apply_end(transitioned, transitioned.duration))
                 _transition_log.append({"transition": transition, "duration": tdur, "applied": True})
-                fade_next = min(tdur, 0.25 * nxt.duration)
-                fade_next = fade_next if fade_next >= 0.12 else 0.0
-                final_clips.append(apply_without_mask(apply_fadein(nxt, fade_next)))
+                # The transition composite already played nxt's first tdur
+                # seconds blended over prev's tail. Resume nxt AFTER that head
+                # so no frames repeat and the overlap consumes exactly tdur of
+                # timeline — the same math as the 4K xfade re-render. (The old
+                # code re-appended nxt in full, replaying its head twice.)
+                nxt_rest = apply_subclip(nxt, tdur, float(nxt.duration))
+                final_clips.append(apply_without_mask(nxt_rest))
                 continue
             except Exception as e:
                 print(f"⚠️ Transition failed ({transition}) at clip {i}: {repr(e)}")
 
-        # fallback: no transition (or tiny fade)
+        # fallback: no transition. If an overlap was planned, trim nxt's tail
+        # by the planned amount so total runtime still matches the budget.
         _transition_log.append({"transition": "crossfade", "duration": 0.0, "applied": False})
+        if tdur > 0 and float(nxt.duration) - tdur >= MIN_KEEP_SEC:
+            nxt = apply_subclip(nxt, 0, float(nxt.duration) - tdur)
+            if i in _trim_log:
+                _s0, _e0 = _trim_log[i]
+                _trim_log[i] = (_s0, max(_s0 + MIN_KEEP_SEC, _e0 - tdur))
         fade_next = min(0.12, 0.15 * nxt.duration)
         fade_next = fade_next if fade_next >= 0.08 else 0.0
         final_clips.append(apply_without_mask(apply_fadein(nxt, fade_next)))
@@ -1306,8 +1542,10 @@ def generate_video(
     if target_duration_sec and float(getattr(final, "duration", 0.0) or 0.0) > float(target_duration_sec) + 0.2:
         final = apply_subclip(final, 0.0, float(target_duration_sec))
 
-    # Optional opening card
-    if show_opening_card and (tone or "").lower() == "cinematic":
+    # Optional opening card — the frontend's "Opening title card" toggle isn't
+    # tone-conditional, so honor it for every tone rather than silently no-op
+    # whenever a user picks anything other than Cinematic.
+    if show_opening_card:
         overlays = []
         try:
             # Build a TextClip compatible with both MoviePy v1 and v2
@@ -1351,8 +1589,14 @@ def generate_video(
     bg_music_clip = None
     if music_path and os.path.exists(music_path):
         try:
+            # Volume is NOT applied here — it depends on whether music ends up
+            # ducked under original audio or carrying the track alone, decided
+            # in the mixing step below. Applying _music_vol unconditionally
+            # here used to double-attenuate the mix_original_audio branch
+            # (tone volume, then another 0.20 on top) and left the music-only
+            # branch far too quiet (tone volumes like 0.15-0.22 as the SOLE
+            # track).
             bg_music_clip = AudioFileClip(music_path)
-            bg_music_clip = apply_audio_volume(bg_music_clip, _music_vol)
 
             # Fit music to final duration (loop when too short, trim when too long).
             if bg_music_clip.duration < final.duration:
@@ -1368,22 +1612,28 @@ def generate_video(
         print("   → Add MP3 files to assets/music/ (see assets/music/README.md)")
 
     # Audio mixing
+    # SOLO_MUSIC_VOL: music is the only audio track (either mix_original_audio
+    # is off, or the clips had no usable audio at all), so it should carry the
+    # edit at a normal listening level rather than the ducked "background bed"
+    # level _music_vol is tuned for.
+    SOLO_MUSIC_VOL = 0.9
     try:
         if bg_music_clip and final.audio is not None:
             if mix_original_audio:
                 mixed = CompositeAudioClip([
                     apply_audio_volume(final.audio, 1.0),
-                    apply_audio_volume(bg_music_clip, 0.20),
+                    apply_audio_volume(bg_music_clip, _music_vol),
                 ])
                 final = apply_set_audio(final, mixed)
             else:
-                final = apply_set_audio(final, bg_music_clip)
+                final = apply_set_audio(final, apply_audio_volume(bg_music_clip, SOLO_MUSIC_VOL))
         elif bg_music_clip and final.audio is None:
-            final = apply_set_audio(final, bg_music_clip)
+            final = apply_set_audio(final, apply_audio_volume(bg_music_clip, SOLO_MUSIC_VOL))
     except Exception as e:
         print(f"⚠️ Audio mix failed, keeping existing audio: {repr(e)}")
 
-    # Final hard target enforcement (trim or extend so output matches requested length).
+    # Final hard target safety net (trim-only; the budget upstream should
+    # already have landed the timeline on target).
     final = enforce_target_duration(final, target_duration_sec)
 
     # Write output
@@ -1453,11 +1703,12 @@ def generate_video(
             except Exception:
                 pass
 
-    # ── Hard duration guarantee ───────────────────────────────────────────────
-    # After MoviePy writes the proxy, verify the actual output duration with
-    # ffprobe. If it is shorter than 90% of target (e.g. because GPT-4o trim
-    # windows were narrower than the allocated budget), pad with a freeze of the
-    # last frame so the video is ALWAYS the requested length.
+    # ── Duration report ───────────────────────────────────────────────────────
+    # Verify the actual output duration with ffprobe. The budget is enforced
+    # upstream (duration-aware selection → exact waterfill → residual
+    # correction), so this is a diagnostic. Freeze-frame padding was removed by
+    # design: when footage genuinely can't fill the target we deliver a shorter
+    # edit and warn instead of cloning the last frame.
     if target_duration_sec:
         try:
             _probe_cmd = [
@@ -1469,41 +1720,13 @@ def generate_video(
             _probe_res = subprocess.run(_probe_cmd, capture_output=True, text=True)
             _actual_dur = float((_probe_res.stdout or "0").strip() or "0")
             _target_dur = float(target_duration_sec)
-            print(f"[DUR] proxy={_actual_dur:.2f}s  target={_target_dur:.2f}s")
-            if _actual_dur < _target_dur * 0.99:
-                _pad_needed = _target_dur - _actual_dur
-                print(f"[DUR] Output is {_actual_dur:.1f}s — padding {_pad_needed:.1f}s to reach {_target_dur:.0f}s")
-                _padded = tempfile.NamedTemporaryFile(delete=False, suffix="_padded.mp4")
-                _padded.close()
-                _pad_cmd = [
-                    "ffmpeg", "-y",
-                    "-i", temp_out.name,
-                    "-vf", f"tpad=stop_mode=clone:stop_duration={_pad_needed:.4f}",
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-                    "-c:a", "aac",
-                    "-t", str(_target_dur),
-                    _padded.name,
-                ]
-                _pad_result = subprocess.run(_pad_cmd, capture_output=True, text=True)
-                if _pad_result.returncode == 0 and os.path.getsize(_padded.name) > 4096:
-                    os.remove(temp_out.name)
-                    # Replace temp_out reference by reassigning via a wrapper object
-                    class _NamedRef:
-                        def __init__(self, name): self.name = name
-                    temp_out = _NamedRef(_padded.name)
-                    print(f"[DUR] Padded proxy → {_target_dur:.0f}s")
-                else:
-                    try:
-                        os.remove(_padded.name)
-                    except Exception:
-                        pass
-                    print(f"[DUR] Padding failed (rc={_pad_result.returncode}), keeping short output")
+            _delta = _actual_dur - _target_dur
+            print(f"[DUR] output={_actual_dur:.2f}s  target={_target_dur:.2f}s  delta={_delta:+.2f}s")
+            if _delta < -2.5:
+                print(f"[DUR] ⚠️ Output is {-_delta:.1f}s short of target — source footage "
+                      f"was insufficient; delivered shorter edit instead of padding.")
         except Exception as _dur_err:
             print(f"[DUR] Duration check skipped: {_dur_err}")
-            try:
-                os.remove(f)
-            except Exception:
-                pass
 
     # ── 4K re-render: replay trim windows on original 4K sources ─────────────
     # All MoviePy work was done on 1080p proxies (fast, low-RAM).
@@ -1521,6 +1744,21 @@ def generate_video(
             proxy_output_path = temp_out.name,
             target_fps        = _fps,
         )
+        # Duration parity check: proxy and 4K timelines share the same trim/
+        # transition math now (real head overlap on both paths), so they must
+        # agree within encoder padding.
+        if target_duration_sec:
+            try:
+                _r4 = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", k4_path],
+                    capture_output=True, text=True,
+                )
+                _dur4 = float((_r4.stdout or "0").strip() or "0")
+                print(f"[DUR] 4k={_dur4:.2f}s  target={float(target_duration_sec):.2f}s  "
+                      f"delta={_dur4 - float(target_duration_sec):+.2f}s")
+            except Exception:
+                pass
         # 4K re-render succeeded — proxy output is no longer needed
         try:
             os.remove(temp_out.name)
@@ -1533,11 +1771,8 @@ def generate_video(
 
 def _get_music_for_tone(tone: str) -> Optional[str]:
     tone = (tone or "").lower()
-    music_map = {
-        "cinematic": "assets/music/cinematic.mp3",
-        "energetic": "assets/music/energetic.mp3",
-        "sentimental": "assets/music/sentimental.mp3",
-        "epic": "assets/music/epic.mp3",
-        "calm": "assets/music/calm.mp3",
-    }
-    return music_map.get(tone)
+    if tone not in ("cinematic", "energetic", "sentimental", "epic", "calm"):
+        return None
+    # Absolute path — the old CWD-relative "assets/music/…" broke whenever the
+    # server wasn't started from the project root.
+    return os.path.join(_MODULE_DIR, "assets", "music", f"{tone}.mp3")

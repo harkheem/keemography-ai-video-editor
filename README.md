@@ -1,6 +1,6 @@
 # KEEMOGRAPHY AI Video Editor
 
-Turn a rough set of video clips into a story-driven short edit — powered by GPT-4o vision, Whisper transcription, and embedding-based clip ranking.
+Turn a rough set of video clips into a story-driven short edit — powered by Gemini video-native analysis (primary), Whisper transcription, and embedding-based clip ranking, with GPT-4o frame analysis as an automatic fallback.
 
 ## Architecture
 
@@ -13,7 +13,7 @@ Turn a rough set of video clips into a story-driven short edit — powered by GP
 │  FastAPI backend (uvicorn)       │  /api/* endpoints
 │  ├── backend/main.py             │  job queue, file management
 │  ├── app_utils.py                │  chunking, transcription helpers
-│  ├── scoring.py                  │  GPT-4o vision + embeddings
+│  ├── scoring.py                  │  Gemini video-native / GPT-4o fallback
 │  ├── editor.py                   │  MoviePy + FFmpeg rendering
 │  └── transition.py               │  crossfade / xfade library
 └──────────────────────────────────┘
@@ -26,7 +26,10 @@ A legacy `app.py` Streamlit interface is still present but is not the production
 ## Features
 
 - **Story-first editing** — rank and arrange clips by semantic similarity to your narrative prompt using OpenAI embeddings.
-- **GPT-4o visual analysis** — each clip is scored for narrative role (hook / payoff / turn / development / b-roll), shot type, emotion, and a visual score; a trim recommendation is generated from sampled frames.
+- **Video-native clip analysis (recommended)** — with `GOOGLE_API_KEY` set, each clip is watched end-to-end by Gemini 2.5 Flash (motion, pacing, and audio included): narrative role, shot type, emotion, visual quality vs story relevance, plus **grounded timestamps** — best moment, emotional peak, and suggested in/out trim points.
+- **GPT-4o frame fallback** — without a Google key, the same analysis runs on sampled frames via GPT-4o (no motion/audio awareness; timestamps are estimates).
+- **Local sensory scoring** — motion magnitude (ffmpeg), audio energy (librosa), face presence (OpenCV), and colour-histogram scene signatures feed clip ranking and shot-variety checks at zero API cost.
+- **Duration-aware selection** — the target length is a hard budget: clips are chosen knapsack-style, allocations waterfilled exactly, and cut boundaries land the render within a fraction of a second of the requested duration (footage permitting — the editor delivers shorter and warns rather than freeze-pad).
 - **Whisper transcription** — clips are transcribed with automatic chunking for files over 24 MB.
 - **Beat-aligned editing** — librosa analyzes the music track for beats and transients; cuts snap to the beat grid.
 - **AI music trim** — GPT-4o suggests the best start/end window of an uploaded track.
@@ -45,7 +48,7 @@ A legacy `app.py` Streamlit interface is still present but is not the production
 |---|---|
 | Frontend | React 18, Vite, Tailwind CSS |
 | Backend | Python 3.11, FastAPI, uvicorn |
-| AI | OpenAI API — `whisper-1`, `text-embedding-3-small`, `gpt-4o` |
+| AI | Google `gemini-2.5-flash` (video-native, primary) · OpenAI `whisper-1`, `text-embedding-3-small`, `gpt-4o` (arc pass + frame fallback) |
 | Video | MoviePy 2, FFmpeg, imageio-ffmpeg |
 | Audio | librosa, scipy, soundfile |
 | Deploy | Docker, Railway |
@@ -101,9 +104,23 @@ pip install -r requirements.txt
 Create `.env` in the project root:
 
 ```env
-OPENAI_API_KEY=sk-...
-# Optional: GOOGLE_API_KEY is not required
+OPENAI_API_KEY=sk-...        # required — Whisper, embeddings, editorial arc pass
+GOOGLE_API_KEY=...           # recommended — enables Gemini 2.5 Flash video-native
+                             # clip analysis (primary path). Without it, analysis
+                             # falls back to GPT-4o frame sampling automatically.
+# VISION_AB_COMPARE=1        # optional — run BOTH analysis paths on each job and
+                             # write a side-by-side markdown report (see below)
 ```
+
+### Vision A/B comparison mode
+
+Set `VISION_AB_COMPARE=1` (with both API keys present) and every `/api/generate`
+job analyzes the clips twice — Gemini video-native (A) and GPT-4o frames (B) —
+then writes a markdown report comparing selected clips, order, trim windows,
+best-moment and emotional-peak timestamps. The report path is pushed over the
+SSE progress stream (`A/B report saved: …`) and logged; the Gemini result drives
+the actual render. Use it on real footage to validate the analysis quality
+before committing, then unset it (it doubles analysis cost and latency).
 
 ### 3. Start the backend
 
